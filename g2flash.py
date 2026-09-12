@@ -793,6 +793,14 @@ def flash_lens(tp, img, segs, stop_before):
                     tp.set_notify(CTRL[0],CTRL[2],True)
                     time.sleep(2.5)
                     while not tp.notes.empty(): tp.notes.get()
+                    # auth_frames() writes the magic as ONE RAW BYTE (0x10,magic), so
+                    # a magic >= 128 is a continued varint that swallows the following
+                    # 0x1a and malforms the request.  By here _seq has advanced with
+                    # the data blocks, and a failed attempt raises before the reset
+                    # below -- so the retries would use CONSECUTIVE magics and all
+                    # three fail together.  Reset first, exactly as flash_lens does,
+                    # to make recovery identical to the initial connect (magic == 1).
+                    _reset_seq()
                     authenticate(tp)
                     _reset_seq()
                     while not tp.notes.empty(): tp.notes.get()
