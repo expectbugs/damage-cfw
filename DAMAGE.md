@@ -18,5 +18,6 @@ Local changes on branch `damage` so far: the one-line flasher fix in `g2flash.py
 (`recover_session()` resets the sequence before authenticating — Damage `HANDOFF.md` §10),
 carried over from the pinned reference clone.
 
-Remotes: `origin` = upstream g2flash (fetch only, never pushed to), `reference` = the pinned local
-clone at `~/damagewm/reference/g2flash`.
+Remotes: `github` = this fork on GitHub (`https://github.com/expectbugs/damage-cfw`, branch
+`damage` tracks it), `origin` = upstream g2flash (fetch only, never pushed to), `reference` = the
+pinned local clone at `~/damagewm/reference/g2flash`.
