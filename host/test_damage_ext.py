@@ -23,11 +23,12 @@ def field(num, value): return varint(num << 3) + varint(value)
 def ldelim(num, body): return varint((num << 3) | 2) + varint(len(body)) + body
 def control(op, arg): return bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM" + bytes([1, op, arg & 0xFF, arg >> 8]))
 FC_ACQUIRE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 5, 1, 0]))
+FC_RELEASE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 6, 1, 0]))
 
 def telemetry(req, tick, flags, status, lease_left, lens):
-    # §3: 1 id · 2 uptime · 3 flags · 4 status · 5 worker µs · 6 copy µs · (7–10 not known on the
-    # host: heap arenas and the panel record are unmapped there) · 11 diagnostics · 12 lease ms left
-    # · (13 boot count: 0 on the host, omitted) · 14 lens
+    # §3: 1 id · 2 uptime · 3 flags · 4 the status register · 5 worker µs · 6 copy µs · (7–10 not
+    # known on the host: heap arenas and the panel record are unmapped there) · 11 diagnostics ·
+    # 12 lease ms left · (13 boot count: not sent by this build) · 14 lens
     body = (field(1, req) + field(2, tick) + field(3, flags) + field(4, status) + field(5, 0) + field(6, 0)
             + field(11, 0) + field(12, lease_left) + field(14, lens))
     return bytes([0x08, 3, 0x10, 0]) + ldelim(111, body)
@@ -58,22 +59,31 @@ def main():
     sends = run(["lens L", "tick 7000", "settings " + FC_ACQUIRE.hex(), "settings " + control(2, 0x8000).hex(),
                  "settings " + control(2, 0x0001).hex(),
                  "tick 17000", "settings " + control(1, 7).hex(),
-                 "tick 200000", "settings " + control(1, 8).hex()])
+                 "tick 200000", "settings " + control(1, 8).hex(),
+                 "settings " + control(3, 0).hex()])
     check("FLAGS_SET PROBE is armed and echoed (left lens, 90 s lease)",
           sends[0], f"send 1 9 {telemetry(0, 7000, 0x8000, 0, 90000, 2).hex()}")
     check("FLAGS_SET of an unimplemented bit changes nothing, status 2",
           sends[1], f"send 1 9 {telemetry(0, 7000, 0x8000, 2, 90000, 2).hex()}")
-    check("flags hold while the lease holds", sends[2], f"send 1 9 {telemetry(7, 17000, 0x8000, 0, 80000, 2).hex()}")
-    check("a lapsed lease clears the flags", sends[3], f"send 1 9 {telemetry(8, 200000, 0, 0, 0, 2).hex()}")
+    check("flags hold while the lease holds; TELEMETRY reports the last recorded status",
+          sends[2], f"send 1 9 {telemetry(7, 17000, 0x8000, 2, 80000, 2).hex()}")
+    check("a lapsed lease clears the flags, not the status register",
+          sends[3], f"send 1 9 {telemetry(8, 200000, 0, 2, 0, 2).hex()}")
+    check("FLAGS_CLEAR records status 0", sends[4], f"send 1 9 {telemetry(0, 200000, 0, 0, 0, 2).hex()}")
 
     sends = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(2, 0x8000).hex(),
-                 "settings " + (bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 6, 1, 0]))).hex(),
-                 "settings " + control(1, 9).hex()])
+                 "settings " + FC_RELEASE.hex(), "settings " + control(1, 9).hex()])
     check("FB_RELEASE clears the flags", sends[-1], f"send 1 9 {telemetry(9, 1000, 0, 0, 0, 1).hex()}")
 
-    sends = run(["lens R", "settings " + (bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM\x01\x01\x2a")).hex(),
-                 "settings " + (bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"XM\x01\x01\x2a\x00")).hex()])
+    short = bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM\x01\x01\x2a")
+    marker = bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"XM\x01\x01\x2a\x00")
+    sends = run(["lens R", "settings " + short.hex(), "settings " + marker.hex()])
     check("a body of the wrong length or marker gets no answer", sends, [])
+    sends = run(["lens R", "settings " + marker.hex(), "settings " + control(1, 11).hex()])
+    check("an unanswered malformed body is recorded: the next TELEMETRY reports status 1",
+          sends, [f"send 1 9 {telemetry(11, 0, 0, 1, 0, 1).hex()}"])
+    sends = run(["lens R", "settings " + control(9, 0).hex()])
+    check("an unknown op is answered, status 1", sends, [f"send 1 9 {telemetry(0, 0, 0, 1, 0, 1).hex()}"])
 
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0

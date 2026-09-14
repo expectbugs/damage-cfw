@@ -33,10 +33,14 @@ commit.
 - **`patches/damage_ext.c` (Damage FIRMWARE.md §0/§3, draft, Phase 1, not flashed):** field 110
   `DamageCaps` on every settings READ response; field 112 control ops (TELEMETRY, FLAGS_SET,
   FLAGS_CLEAR) answered with a field-111 telemetry record; flags (only bit 15 PROBE implemented)
-  cleared at every texture-cache release point. It rides the settings hooks already in place — no
-  new patch site (the site list is unchanged). `host/test_damage_ext.py` checks the bytes against
-  the contract. Pin with it: `b88eb6b9…`. The no-feature baseline (the same sources as the installed
-  image, our clang) is commit `6db86e2`, pin `1920dda6…`.
+  cleared at every texture-cache release point; field 4 of the record is a status register (the
+  last recording op's status — TELEMETRY records nothing; a malformed body records 1 and gets no
+  reply). The boot count (field 13) is not sent: stock keeps `kvbooCount` only in the KV store
+  (Damage `CLAIMS.md`, 2026-09-14). It rides the settings hooks already in place — no new patch
+  site (the site list is unchanged). `host/test_damage_ext.py` checks the bytes against the
+  contract (11 checks). Pin with it: `f9211ea2…` (2026-09-14; `b88eb6b9…` was the 2026-09-13 build,
+  with "this op's status" and an unverified boot-count read). The no-feature baseline (the same
+  sources as the installed image, our clang) is commit `6db86e2`, pin `1920dda6…`.
 
 A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
 image (`*.bin` is ignored by git).

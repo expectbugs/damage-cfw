@@ -19,8 +19,23 @@
  * other bit changes nothing and records status 2. Flags clear wherever the texture
  * cache is released (lease expiry, FB_RELEASE, a fresh acquire, mode 11).
  *
- * The telemetry walk over the heap arenas is the same validated, lock-free read the
- * diagnostic overlay uses (debug.c); an arena that does not validate is omitted.
+ * The status (field 4 of the record) is a register: it holds the status recorded by
+ * the last op that records one — FLAGS_SET, FLAGS_CLEAR, a malformed or unknown
+ * request. TELEMETRY records nothing, so a refusal the phone did not see is still
+ * readable afterwards (FIRMWARE.md §1.2).
+ *
+ * The telemetry walk over the heap arenas is the same validated, bounded, lock-free
+ * read the diagnostic overlay uses (malloc.c tlsf_arena_free: every size word is
+ * range-checked before it is read); an arena that does not validate is omitted.
+ *
+ * The boot count (field 13) is not sent by this build. Stock reads `kvbooCount`
+ * through the KV get into a stack temporary, adds one and writes it back
+ * (FUN_004d96d8, 0x004d99de..0x004d9a38); no RAM word holds the value, so reading
+ * it means calling the KV store, and that call has no precedent from this context
+ * yet (Damage CLAIMS.md, 2026-09-14).
+ *
+ * The reply buffer is one per lens: the stock sender copies the body into its own
+ * queue block before it returns (FUN_00475b14 -> FUN_0047564e).
  */
 
 #define DMG_CAPS_FIELD        110u
@@ -37,10 +52,6 @@
 #define DMG_STATUS_MALFORMED  1u
 #define DMG_STATUS_UNSUPPORTED 2u
 
-/* The stock KV store's boot counter, read back and incremented at every start
- * (openCFW g2-service-kvdb-recovery.md, kvbooCount). Graded I until it is read on
- * glass across a reset. 0 = not known. */
-#define DMG_BOOT_COUNT (*(volatile uint32_t *)0x20074988u)
 /* The active ULED operations record (FUN_004c9f32 stores it): 0x0070afe4 A6N-G,
  * 0x0070b024 JBD4010, 0 before panel selection. */
 #define DMG_PANEL_OPS  (*(volatile uint32_t *)0x20074530u)
@@ -89,8 +100,7 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id) {
     n += damage_put_varint_field(body + n, 11, diag);
     uint32_t left = leased ? ctx->direct_lease_deadline - tick : 0u;
     n += damage_put_varint_field(body + n, 12, left);
-    uint32_t boots = DMG_BOOT_COUNT;
-    if (boots) n += damage_put_varint_field(body + n, 13, boots);
+    /* field 13 (boot count): not sent — see the header comment */
     n += damage_put_varint_field(body + n, 14, FW_SIDE_ID());
 
     /* G2SettingPackage{ 1: commandId 3, 2: magic 0, 111: body } */
@@ -107,15 +117,14 @@ void damage_apply_control(const uint8_t *data, uint32_t len) {
     customCfwContext *ctx = getCustomCfwContext();
     if (!ctx) return;
     if (len != 6u || data[0] != 'D' || data[1] != 'M' || data[2] != 1u) {
-        ctx->dmg_status = DMG_STATUS_MALFORMED;
+        ctx->dmg_status = DMG_STATUS_MALFORMED;  /* recorded, not answered */
         return;
     }
     unsigned op = data[3];
     unsigned arg = (unsigned)data[4] | ((unsigned)data[5] << 8);
     unsigned request_id = 0;
     if (op == DMG_OP_TELEMETRY) {
-        request_id = arg;
-        ctx->dmg_status = DMG_STATUS_OK;
+        request_id = arg;                        /* records no status: field 4 is the register */
     } else if (op == DMG_OP_FLAGS_SET) {
         if (arg & ~DMG_FLAGS_IMPLEMENTED) {
             ctx->dmg_status = DMG_STATUS_UNSUPPORTED;
@@ -127,7 +136,7 @@ void damage_apply_control(const uint8_t *data, uint32_t len) {
         ctx->dmg_flags = 0;
         ctx->dmg_status = DMG_STATUS_OK;
     } else {
-        ctx->dmg_status = DMG_STATUS_MALFORMED;
+        ctx->dmg_status = DMG_STATUS_MALFORMED;  /* unknown op: recorded and answered */
     }
     damage_send_telemetry(ctx, request_id);
 }
