@@ -30,6 +30,13 @@ commit.
 - `host/`: the patch sources compiled for 32-bit x86 with the firmware's addresses mapped, and the
   conformance-vector runner (`host/README.md`). The two ARM-assembly entry shims sit under
   `#ifndef CFW_HOST`; the glasses build is byte-identical with or without that guard.
+- **`patches/damage_ext.c` (Damage FIRMWARE.md §0/§3, draft, Phase 1, not flashed):** field 110
+  `DamageCaps` on every settings READ response; field 112 control ops (TELEMETRY, FLAGS_SET,
+  FLAGS_CLEAR) answered with a field-111 telemetry record; flags (only bit 15 PROBE implemented)
+  cleared at every texture-cache release point. It rides the settings hooks already in place — no
+  new patch site (the site list is unchanged). `host/test_damage_ext.py` checks the bytes against
+  the contract. Pin with it: `b88eb6b9…`. The no-feature baseline (the same sources as the installed
+  image, our clang) is commit `6db86e2`, pin `1920dda6…`.
 
 A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
 image (`*.bin` is ignored by git).

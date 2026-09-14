@@ -112,15 +112,21 @@ typedef struct {
     uint32_t mic_lease_deadline;            /* FW_MS_TICK streaming-lease deadline; 0 = none */
     uint32_t mic_watchdog_timer;            /* one-shot osTimer tearing down a lapsed session */
     uint8_t  mic_notify_buf[32];            /* stable storage for the field-104 sid-0x09 notify */
+    /* --- Damage settings extension (damage_ext.c; Damage FIRMWARE.md §0/§3, draft).
+     * Appended at the tail so every existing field offset is unchanged. --- */
+    uint32_t dmg_flags;                     /* flags armed by the phone; cleared with the lease */
+    uint8_t  dmg_status;                    /* last status of a Damage op (0 ok) */
+    uint8_t  dmg_reply_buf[128];            /* stable storage for the field-111 telemetry reply */
 } customCfwContext;
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */
 #define CFW_ALLOC_DIAG_SLOT 0x202a6274U /* second word: magic | sticky failure bit */
 #define CFW_ALLOC_DIAG_MAGIC 0xA110CA7EU
-#define CFW_CTX_MAGIC 0xC0FFEE68U    /* bumped for the context layout change (mic fields) */
+#define CFW_CTX_MAGIC 0xC0FFEE69U    /* bumped for the context layout change (Damage fields) */
 
 #define FW_MS_TICK  (*(volatile uint32_t *)0x20074a34U)  /* firmware 1 ms OS tick (SysTick chain) */
 
 static customCfwContext *peekCustomCfwContext(void);
 static customCfwContext *getCustomCfwContext(void);
 int cfw_fb_lease_active(void);
+void damage_clear_flags(customCfwContext *ctx);   /* damage_ext.c: at every lease release point */

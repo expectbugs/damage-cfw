@@ -28,6 +28,9 @@
  *                    handler — the firmware's own entry points — answers "rc N"
  *   crc              answers "crc SHADOW FB presents P gate TAKES/GIVES"
  *   flags            answers "flags reorder skip dup snapof alloc"
+ *   settings HEX     a whole sid-0x09 request payload through settings_decode_wrapper
+ *   respond HEX      a stock settings response body through settings_send_wrapper
+ * Every message the patch code sends answers "send TYPE SID HEX".
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -45,6 +48,8 @@ int host_flags(uint8_t *out);
 int cfw_snapshot(uint8_t *state, uint32_t container_id);
 int image_deferred(uint8_t *state, uint8_t *src, uint32_t len);
 void display_copy_hook(void);
+int settings_decode_wrapper(void *stream, const void *fields, void *dest);
+int settings_send_wrapper(int type, int sid, unsigned char *buf, unsigned len);
 
 /* ---- fixed regions (addresses from the patch sources) ---- */
 #define CODE_BASE   0x00438000u   /* stock main app load address */
@@ -132,7 +137,12 @@ static void *h_malloc(uint32_t n) {
 static void h_free(void *p) { (void)p; }
 static void *h_heap_malloc(uint32_t desc, uint32_t n) { (void)desc; return malloc(n); }
 static void h_heap_free(uint32_t desc, void *p) { (void)desc; free(p); }
-static int h_send(int t, int sid, unsigned char *b, unsigned l) { (void)t; (void)sid; (void)b; (void)l; return 0; }
+static int h_send(int t, int sid, unsigned char *b, unsigned l) {
+    printf("send %d %d ", t, sid);
+    for (unsigned i = 0; i < l; i++) printf("%02x", b[i]);
+    printf("\n");
+    return 0;
+}
 static int h_pb_decode(void *s, const void *f, void *d) { (void)s; (void)f; (void)d; return 1; }
 static unsigned h_wear(void) { return 2; }
 static int evenhub_mode = 0xe0;
@@ -231,6 +241,14 @@ int main(void) {
             cfw_snapshot(state, 0);
             int rc = image_deferred(state, (uint8_t *)(uintptr_t)BUF_B, len);
             printf("rc %d\n", rc);
+        } else if (!strncmp(line, "settings ", 9)) {
+            if (!unhex(line + 9, buf, sizeof buf, &n)) { printf("error settings hex\n"); continue; }
+            uint32_t stream[4] = {0, (uint32_t)(uintptr_t)buf, (uint32_t)n, 0};   /* pb_istream_t */
+            settings_decode_wrapper(stream, 0, 0);
+        } else if (!strncmp(line, "respond ", 8)) {
+            static unsigned char resp[256];
+            if (!unhex(line + 8, resp, sizeof resp, &n)) { printf("error respond hex\n"); continue; }
+            settings_send_wrapper(1, 9, resp, (unsigned)n);
         } else if (!strncmp(line, "crc", 3)) {
             uLong s = crc32(0L, (const Bytef *)(uintptr_t)BUF_A, 153600u);
             uLong f = crc32(0L, (const Bytef *)(uintptr_t)HOST_FB, 153600u);

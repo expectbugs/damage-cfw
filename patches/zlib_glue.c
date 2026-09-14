@@ -827,6 +827,7 @@ static int cfw_cleanup_session(void) {
     ctx->direct_shadow = 0;
     ctx->direct_failed = 0;
     cfw_texture_cache_release(ctx);
+    damage_clear_flags(ctx);
 
     /* Suppress callbacks before asking the timer service to stop/delete them;
      * a callback already dispatched on the timer thread will then be harmless. */

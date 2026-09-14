@@ -50,6 +50,11 @@ typedef int  (*pb_decode_fn)(void *stream, const void *fields, void *dest);
  * sid-0x09 hooks below — no new patch sites. */
 #define MIC_CONTROL_FIELD 103u
 void mic_apply_control(const uint8_t *data, uint32_t len);
+/* Damage settings extension (damage_ext.c, same translation unit): field 112
+ * carries Damage's control ops, field 110 advertises the Damage contract. */
+#define DMG_CONTROL_FIELD 112u
+void damage_apply_control(const uint8_t *data, uint32_t len);
+unsigned damage_append_caps(unsigned char *buf, unsigned len, unsigned capacity);
 unsigned mic_append_status(unsigned char *buf, unsigned len, unsigned capacity);
 typedef void (*display_start_fn)(unsigned app_id, void *arg, unsigned arg_len, void *cb);
 
@@ -105,6 +110,7 @@ __attribute__((used, noinline)) int cfw_fb_lease_active(void) {
         ctx->direct_lease_deadline = 0;
         ctx->direct_active = 0;
         cfw_texture_cache_release(ctx);
+        damage_clear_flags(ctx);
         return 0;
     }
     return 1;
@@ -253,12 +259,14 @@ static void faceclaw_apply_control(const uint8_t *data, uint32_t len) {
             (int32_t)(ctx->direct_lease_deadline - FW_MS_TICK) <= 0) {
             ctx->direct_active = 0;
             cfw_texture_cache_release(ctx);
+            damage_clear_flags(ctx);
         }
         ctx->direct_lease_deadline = FW_MS_TICK + FACECLAW_LEASE_MS;
     } else if (op == FACECLAW_OP_FB_RELEASE) {
         ctx->direct_lease_deadline = 0;
         ctx->direct_active = 0;
         cfw_texture_cache_release(ctx);
+        damage_clear_flags(ctx);
     } else if (op == FACECLAW_OP_WEAR_QUERY) {
         unsigned status = FW_WEAR_STATUS();
         if (status == 1u || status == 2u)
@@ -288,6 +296,8 @@ static void faceclaw_scan_settings_control(const uint8_t *buf, uint32_t len) {
                 faceclaw_apply_control(p, item_len);
             else if (field == MIC_CONTROL_FIELD)
                 mic_apply_control(p, item_len);
+            else if (field == DMG_CONTROL_FIELD)
+                damage_apply_control(p, item_len);
             p += item_len;
         } else if (wire == 5) {
             if ((uint32_t)(end - p) < 4) return;
@@ -363,6 +373,7 @@ int settings_send_wrapper(int type, int sid, unsigned char *buf, unsigned len) {
                                     100u, (const unsigned char *)caps,
                                     (unsigned)sizeof(caps) - 1u);
         len = mic_append_status(buf, len, SETTINGS_RESPONSE_CAPACITY);
+        len = damage_append_caps(buf, len, SETTINGS_RESPONSE_CAPACITY);
     }
     return ((send_fn)FW_SEND)(type, sid, buf, len);
 }
