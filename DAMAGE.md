@@ -11,12 +11,28 @@ the conformance vectors live in `~/damagewm/firmware/vectors/`. Damage itself st
 it holds no code from this repo, only the contract.
 
 Rules carried over from Damage's `CLAUDE.md`: never flash without Adam's in-the-moment go; the
-dry-run staircase first, every time; read every patch source before it is flashed; keep the
-appended code off the boot path; keep the wording plain in every file, comment and commit.
+dry-run staircase first, every time; read every patch source before it is flashed; no new site on a
+path that runs before the first radio message; keep the wording plain in every file, comment and
+commit.
 
-Local changes on branch `damage` so far: the one-line flasher fix in `g2flash.py`
-(`recover_session()` resets the sequence before authenticating — Damage `HANDOFF.md` §10),
-carried over from the pinned reference clone.
+## Local changes on branch `damage`
+
+- `g2flash.py`: `recover_session()` resets the sequence before authenticating (Damage
+  `HANDOFF.md` §10), carried over from the pinned reference clone.
+- **The patch set is pinned to this machine's toolchain (2026-09-13).** clang 22.1.8 builds the
+  unchanged a5d1c31 sources into output `1920dda6…` (upstream's pin, from a different clang, is
+  `d4054ab1…`, the image installed on Adam's glasses since 2026-08-30 and archived in Damage's
+  `fws/2.2.6.10-cfw-d4054ab1/`). Same sources, different code layout: every redirected call moves
+  with the function offsets. `build_cfw.sh` and `patches/cfw_patches.json` carry the new pin.
+- `tools/verify.py`: the offline check before any flashing conversation — stock hash, the pinned
+  output, reproducibility with the local clang, openCFW's Thumb-bit audit, the flasher's own size
+  guard, and the list of every changed site with its run address and containing function.
+- `host/`: the patch sources compiled for 32-bit x86 with the firmware's addresses mapped, and the
+  conformance-vector runner (`host/README.md`). The two ARM-assembly entry shims sit under
+  `#ifndef CFW_HOST`; the glasses build is byte-identical with or without that guard.
+
+A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
+image (`*.bin` is ignored by git).
 
 Remotes: `github` = this fork on GitHub (`https://github.com/expectbugs/damage-cfw`, branch
 `damage` tracks it), `origin` = upstream g2flash (fetch only, never pushed to), `reference` = the

@@ -1073,6 +1073,7 @@ int cfw_snapshot(uint8_t *state, uint32_t container_id) {
  * (0x500a04 / 0x500df8, both lenses). r7 = state, r8 = containerId at that point, so
  * pass them to cfw_snapshot and tail-branch — cfw_snapshot returns the lens id, which
  * flows back to the caller for the RIGHT gate. It preserves r4-r11, so state/... survive. */
+#ifndef CFW_HOST   /* ARM assembly entry shim: left out of the x86 host build (host/README.md) */
 __attribute__((naked)) int snapshot_side(void) {
     __asm volatile(
         "mov r0, r7\n\t"       /* state */
@@ -1080,6 +1081,7 @@ __attribute__((naked)) int snapshot_side(void) {
         "b   cfw_snapshot\n\t" /* tail-call; resolved intra-.text by build.py */
     );
 }
+#endif
 
 /* Replaces the deferred consumer's worker call (bl at 0x496a0e, both lenses). Stock-
  * compressed updates use the stock-decoded call arguments directly. Otherwise DRAINS

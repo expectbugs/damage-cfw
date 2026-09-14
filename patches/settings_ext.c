@@ -314,6 +314,7 @@ int settings_decode_wrapper(void *stream, const void *fields, void *dest) {
  * (`push {r0-r6,lr}; mov r6,r0`) are replaced by a B.W here. Reproduce them,
  * suppress only START while a valid Faceclaw lease exists, and otherwise
  * resume the stock function at 0x004e1fd6 with every argument restored. */
+#ifndef CFW_HOST   /* ARM assembly entry shim: left out of the x86 host build (host/README.md) */
 __attribute__((naked)) void faceclaw_evenai_display_entry(void) {
     __asm volatile(
         "push {r0-r6, lr}\n"
@@ -333,6 +334,7 @@ __attribute__((naked)) void faceclaw_evenai_display_entry(void) {
         "pop {r0-r6, pc}\n"
     );
 }
+#endif
 
 // Capability string "EVENCFW/<ver> <space-separated feature tokens>":
 //   EVENCFW/16 -> magic prefix + contract version (detect: starts-with "EVENCFW/")
