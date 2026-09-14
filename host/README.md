@@ -17,6 +17,10 @@ flashed or sent to a device. It is display-rendering test tooling.
   with the same prototype. inflate is the host's zlib; the display task's refresh runs
   synchronously (copy hook, then the gate given back); timers, sound, radio and sensors do nothing.
 - `run_vectors.py` builds the harness and runs the conformance vectors, one process per lens.
+- `test_damage_ext.py` checks `patches/damage_ext.c` (Damage `FIRMWARE.md` §0/§3: DamageCaps, the control
+  ops, the telemetry record, flags cleared with the lease) byte for byte against expectations written from
+  the contract text. The harness answers `settings HEX` and `respond HEX` for it and prints every message the
+  patch code sends.
 
 ## The vectors
 
@@ -28,6 +32,7 @@ files through its Kotlin simulator. For v1 (the installed firmware) the C is the
 ```
 python3 host/run_vectors.py --write     # after Damage's make_vectors.py changes the inputs
 python3 host/run_vectors.py             # check
+python3 host/test_damage_ext.py         # the settings extension against the contract
 ```
 
 Needs clang, a 32-bit libc and a 32-bit zlib (Gentoo multilib: present on beardos).
