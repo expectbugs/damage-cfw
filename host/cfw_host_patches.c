@@ -42,7 +42,9 @@ int host_flags(uint8_t *out) {
 /* The Damage extension's state (damage_ext.c), for tests of what the left lens holds
  * but cannot report: flags, the status register, the cache generation and the
  * cache-keep latch, the direct presents and the last transfer stamp, the self-test's
- * step count, last refusal and scratch CRC, and whether a texture cache is allocated. */
+ * step count, last refusal and scratch CRC, whether a texture cache is allocated, and
+ * the direct-frame flag (zlib_glue.c direct_active: the physical framebuffer holds a
+ * Damage frame that stock repaints must not overwrite while the lease holds). */
 void host_damage_state(uint32_t *out) {
     customCfwContext *ctx = peekCustomCfwContext();
     if (!ctx) return;
@@ -50,4 +52,5 @@ void host_damage_state(uint32_t *out) {
     out[3] = ctx->dmg_cache_keep_latched; out[4] = ctx->dmg_present_seq; out[5] = ctx->dmg_last_transfer_us;
     out[6] = ctx->dmg_st_seq; out[7] = ctx->dmg_st_refused; out[8] = ctx->dmg_st_crc;
     out[9] = ctx->texture_cache != 0;
+    out[10] = ctx->direct_active;
 }

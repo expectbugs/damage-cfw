@@ -144,9 +144,14 @@ typedef struct {
     uint32_t dmg_cache_gen;                 /* mode-12 writes that changed the cache since boot */
     /* The self-test (mode 16): a scratch shadow the drawing ops run against with
      * presents suppressed, its own frame-order diagnostics, and the last step's result. */
-    uint8_t *dmg_st_shadow;                 /* PANEL_BYTES from heap 13, or 0 */
-    uint8_t  dmg_st_active;                 /* a step is running: present_shadow returns without publishing */
-    uint8_t  dmg_st_free_pending;           /* a release arrived from another task during a step: the step's epilogue frees */
+    /* The three below are written and read from different tasks — a step on the EvenHub
+     * task, a release from the settings task or the input thread — so they are volatile:
+     * the mark-then-read in damage_self_test and the check-then-free in
+     * damage_self_test_release keep their program order. The window that remains between
+     * the two is the one the installed firmware already has for its texture cache. */
+    uint8_t *volatile dmg_st_shadow;        /* PANEL_BYTES from heap 13, or 0 */
+    volatile uint8_t dmg_st_active;         /* a step is running: present_shadow returns without publishing */
+    volatile uint8_t dmg_st_free_pending;   /* a release arrived from another task during a step: the step's epilogue frees */
     uint8_t  dmg_st_refused;                /* the last step's message was refused */
     uint32_t dmg_st_seq;                    /* steps run since the begin */
     uint32_t dmg_st_crc;                    /* CRC-32 of the scratch shadow after the last step */

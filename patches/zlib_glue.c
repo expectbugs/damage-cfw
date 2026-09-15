@@ -762,6 +762,12 @@ static int load_bmp_fast(uint8_t *state, const uint8_t *bmp, uint32_t len) {
      * compositor, so subsequent widget repaints must not preserve a prior direct
      * frame even if Faceclaw's ownership lease is still alive. */
     customCfwContext *ctx = peekCustomCfwContext();
+    /* A Damage self-test step (damage_ext.c, mode 16) dispatches against a stack-built
+     * container state whose only buffer is the scratch shadow. A message that falls
+     * through to this loader there — a mode-3/6 message too short for its own header,
+     * alone or inside a batch — is refused outright: the live direct frame stays, and
+     * the stock loader never sees a state with no LVGL object behind it. */
+    if (ctx && ctx->dmg_st_active) return -1;
     if (ctx) ctx->direct_active = 0;
 
     if (bmp == 0 || len < 0x36 || bmp[0] != 0x42 || bmp[1] != 0x4d)  /* "BM" */
@@ -902,6 +908,10 @@ void display_copy_hook(void) {
                 return;                                  /* preserve the physical direct frame */
             ctx->direct_active = 0;                       /* fail open to the stock compositor */
         }
+        /* F1.3 (damage_ext.c): the framebuffer is about to hold stock content, so the
+         * refresh that follows is not a Damage frame's transfer. A mark left by a direct
+         * copy whose refresh the display task skipped (panel off) must not stamp it. */
+        if (ctx) ctx->dmg_direct_presented = 0;
         FW_DISPLAY_COPY();
         return;
     }

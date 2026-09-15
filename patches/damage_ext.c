@@ -67,7 +67,10 @@
  * (peekCustomCfwContext, the same read display_copy_hook makes on this task): with no
  * context, or when the frame being refreshed is not a Damage frame, it is the stock
  * call with its six arguments unchanged. After a direct copy it stamps the call with
- * the DWT cycle counter (debug.c) and, while PRESENTED is armed, sends field 113.
+ * the DWT cycle counter (debug.c) and, while PRESENTED is armed, sends field 113. The
+ * copy hook clears the mark again on its stock-copy path, so a mark left by a direct
+ * copy whose refresh the display task skipped (panel off, 0x00473cca) never stamps a
+ * later stock refresh as a Damage frame's.
  *
  * ---- Cache-keep (F1.5) ----------------------------------------------------------------
  * Upstream frees the texture cache at four points: a lapse noticed by
@@ -76,7 +79,9 @@
  * damage_lease_fresh_acquire: at the lapse or release the CACHE_KEEP flag, read before
  * the flags clear, is latched — once per lease (dmg_lease_settled), so a release that
  * follows a lapse already noticed cannot re-read the cleared flags and drop the latch;
- * the fresh acquire that follows consumes the latch and keeps or frees the cache. The phone re-arms the flag every session; a session that
+ * the fresh acquire that follows consumes the latch and keeps or frees the cache. The
+ * flags themselves clear at every release point whether the lapse was settled before it
+ * or not. The phone re-arms the flag every session; a session that
  * does not re-arm it gets upstream's behaviour at the next lapse. Mode 11 (the
  * hand-back to stock) frees the cache regardless. dmg_cache_gen counts the mode-12
  * writes that changed the cache (texture_cache.c); CACHE_INFO adds the CRC-32 of the
@@ -84,7 +89,7 @@
  *
  * ---- The self-test (mode 16) -----------------------------------------------------------
  * [16][0] allocates and zeroes a scratch shadow (PANEL_BYTES from heap 13) while the
- * lease is held; [16][1][message] runs one drawing message — any shadow message a
+ * lease is held, under the same active mark a step runs under; [16][1][message] runs one drawing message — any shadow message a
  * batch could carry: 3/6/8/9/13/14/15, with mode 8's own rules inside a batch — through
  * the unchanged image_dispatch against the scratch shadow, with presents suppressed
  * (present_shadow returns while dmg_st_active) and the self-test's own fid ring and
@@ -93,8 +98,11 @@
  * count and whether the message was refused, for the telemetry record (fields 20-22).
  * Every step needs the lease (the check settles a lapse, which frees the scratch).
  * Modes 13/14/15 read the live texture cache and the built-in font; mode 12 (a live
- * cache write) and every non-drawing mode are refused. [16][2] frees the scratch; so
- * does every lease release point. Both lenses run every step; only RIGHT can report.
+ * cache write) and every non-drawing mode are refused, and so is a mode-3/6 message
+ * too short for its own header (the normal path's BMP fallback, load_bmp_fast, refuses
+ * while a step runs: the scratch is not a container and the live direct frame is not
+ * the step's to drop). [16][2] frees the scratch; so does every lease release point.
+ * Both lenses run every step; only RIGHT can report.
  */
 
 #define DMG_CAPS_FIELD        110u
@@ -161,14 +169,26 @@ void damage_clear_flags(customCfwContext *ctx) {
 /* The scratch is used by the EvenHub task (a step) and released from wherever a
  * lease release point runs — the settings task (FB_RELEASE, a fresh acquire) or the
  * input thread (a lapse noticed by cfw_fb_lease_active). A release that lands while a
- * step runs is deferred to the step's epilogue instead of freeing under it; the same
- * window exists for the installed firmware's texture cache and is left as it is. */
+ * step runs is deferred to the step's epilogue instead of freeing under it. The fields
+ * are volatile (cfw_context.h) so the step's mark-then-read and this check-then-free
+ * keep their program order; the window between a release's check and a step's mark is
+ * the same one the installed firmware has for its texture cache and is left as it is. */
 static void damage_self_test_release(customCfwContext *ctx) {
     if (ctx == 0) return;
     if (ctx->dmg_st_active) { ctx->dmg_st_free_pending = 1; return; }
     uint8_t *shadow = ctx->dmg_st_shadow;
     ctx->dmg_st_shadow = 0;
     if (shadow) cfw_heap13_free(shadow);
+}
+
+/* The end of a begin or a step: the active mark drops, and a release that landed
+ * from another task meanwhile (deferred above) is honoured now. Returns 1 if one had. */
+static int damage_self_test_settle(customCfwContext *ctx) {
+    ctx->dmg_st_active = 0;
+    if (!ctx->dmg_st_free_pending) return 0;
+    ctx->dmg_st_free_pending = 0;
+    damage_self_test_release(ctx);
+    return 1;
 }
 
 /* A lapse noticed by cfw_fb_lease_active, or an FB_RELEASE: settle what the flags
@@ -179,7 +199,13 @@ static void damage_self_test_release(customCfwContext *ctx) {
 void damage_lease_ended(customCfwContext *ctx) {
     if (ctx == 0) return;
     damage_self_test_release(ctx);
-    if (ctx->dmg_lease_settled) return;
+    if (ctx->dmg_lease_settled) {
+        /* Settled already (a lapse noticed before this release): the latch stands, but
+         * the flags still clear — a FLAGS_SET taken since that lapse would otherwise
+         * survive the FB_RELEASE (2026-09-14, second review). */
+        ctx->dmg_flags = 0;
+        return;
+    }
     ctx->dmg_lease_settled = 1;
     ctx->dmg_cache_keep_latched = (ctx->dmg_flags & DMG_FLAG_CACHE_KEEP) ? 1u : 0u;
     if (!ctx->dmg_cache_keep_latched) cfw_texture_cache_release(ctx);
@@ -376,18 +402,23 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
     unsigned sub = src[1];
     if (sub == DMG_ST_BEGIN) {
         if (!cfw_fb_lease_active()) return -1;
-        if (ctx->dmg_st_shadow == 0) {
-            uint8_t *shadow = (uint8_t *)cfw_heap13_malloc(DMG_ST_SHADOW_BYTES);
-            if (shadow == 0) return -1;
+        /* The scratch is allocated and zeroed under the active mark, as a step runs
+         * under it: a release from another task in that time is deferred to the settle
+         * below instead of freeing the scratch while it is being zeroed (2026-09-14,
+         * second review). A begin the lease ended during is refused, the scratch freed. */
+        ctx->dmg_st_active = 1;
+        uint8_t *shadow = ctx->dmg_st_shadow;
+        if (shadow == 0) {
+            shadow = (uint8_t *)cfw_heap13_malloc(DMG_ST_SHADOW_BYTES);
+            if (shadow == 0) { damage_self_test_settle(ctx); return -1; }
             ctx->dmg_st_shadow = shadow;
         }
-        bzero(ctx->dmg_st_shadow, DMG_ST_SHADOW_BYTES);
-        ctx->dmg_st_free_pending = 0;
+        bzero(shadow, DMG_ST_SHADOW_BYTES);
         ctx->dmg_st_seq = 0;
         ctx->dmg_st_refused = 0;
         ctx->dmg_st_crc = 0;
         damage_diag_reset(&ctx->dmg_st_diag);
-        return 0;
+        return damage_self_test_settle(ctx) ? -1 : 0;
     }
     if (sub == DMG_ST_END) {
         damage_self_test_release(ctx);
@@ -399,7 +430,7 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
      * the scratch pointer is read once, under that guard. */
     ctx->dmg_st_active = 1;
     uint8_t *scratch = ctx->dmg_st_shadow;
-    if (scratch == 0) { ctx->dmg_st_active = 0; return -1; }   /* no begin, or the lease released it */
+    if (scratch == 0) { damage_self_test_settle(ctx); return -1; }   /* no begin, or the lease released it */
     const uint8_t *msg = src + 2;
     uint32_t msglen = srclen - 2u;
     unsigned mode = msg[0] & 0x7fu;
@@ -426,10 +457,6 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
     ctx->dmg_st_seq++;
     ctx->dmg_st_refused = rc == 0 ? 0u : 1u;
     ctx->dmg_st_crc = damage_crc32(scratch, DMG_ST_SHADOW_BYTES);
-    ctx->dmg_st_active = 0;
-    if (ctx->dmg_st_free_pending) {              /* a release landed during the step */
-        ctx->dmg_st_free_pending = 0;
-        damage_self_test_release(ctx);
-    }
+    damage_self_test_settle(ctx);                /* a release that landed during the step is honoured now */
     return rc;
 }

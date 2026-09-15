@@ -12,7 +12,9 @@ so a left-lens check reads the context through `dmg` instead; the display task's
 refresh call advances the cycle counter by 1,234 µs, so the F1.3 stamp is 1,234 here;
 the worker's own stamp brackets the whole dispatch, which on the host includes the
 synchronous refresh, so a presented frame's worker figure reads 1,234 too (on the
-glasses the display task runs on its own; the figure there is the real worker time).
+glasses the display task runs on its own; the figure there is the real worker time);
+`panel 0|1` is the display task's panel-on word (a type-3 refresh skips the refresh
+call while it is 0) and `refresh` one stock type-3 refresh with no Damage job pending.
 """
 import json, pathlib, subprocess, sys, zlib
 
@@ -72,7 +74,7 @@ def sends(lines): return [l for l in lines if l.startswith("send ")]
 def dmg(lines):
     """The last `dmg` line as a dict (host_damage_state's order)."""
     l = [x for x in lines if x.startswith("dmg ")][-1].split()
-    keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache"]
+    keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache", "directActive"]
     return {k: (int(v, 16) if k == "stCrc" else int(v)) for k, v in zip(keys, l[1:])}
 def rcs(lines): return [int(l.split()[1]) for l in lines if l.startswith("rc ")]
 
@@ -223,6 +225,54 @@ def main():
     check("TELEMETRY carries the step count, the refusal and the scratch CRC (fields 20-22)",
           sends(lines)[-1], f"send 1 9 {telemetry(12, 1000, 0, 0, 90000, 1, st=(1, 0, d[0]['stCrc'])).hex()}")
     check("the lease's lapse releases the scratch: the next step is refused and not counted", (rcs(lines)[-1], d[1]["stSeq"]), (-1, 1))
+
+    print("-- the self-test: what a step may not reach (2026-09-14 review)")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + kf, "dmg", "crc", "msg 1000",
+                 "msg 100103", "dmg",                                  # a mode-3 message of one byte
+                 "msg 100106", "dmg",                                  # a mode-6 message of one byte
+                 "msg 1001" + "08" + "01" + "0100" + "03", "dmg",      # a batch whose one sub-message is [03]
+                 "crc"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    c0, c1 = [l.split() for l in lines if l.startswith("crc ")]
+    check("a mode-3 or mode-6 message too short for its header, alone or inside a batch, is refused and counted, the scratch untouched",
+          (rcs(lines)[-3:], [(x["stSeq"], x["stRefused"], x["stCrc"]) for x in d[1:]]),
+          ([-1, -1, -1], [(1, 1, zero_crc), (2, 1, zero_crc), (3, 1, zero_crc)]))
+    check("the live direct frame stays active and the stock BMP loader is never reached from a step (the normal path's fallback is closed there)",
+          (d[0]["directActive"], [x["directActive"] for x in d[1:]], c0[8], c1[8], c1[1] == c0[1], c1[4]),
+          (1, [1, 1, 1], "0", "0", True, "1"))
+
+    print("-- F1.3: the mark across the display task's panel-off path (2026-09-14 review)")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PRESENTED).hex(),
+                 "panel 0", "msg " + kf, "dmg",                        # the copy runs, the refresh does not
+                 "panel 1", "refresh", "dmg", "refresh", "dmg"])       # the first refresh after transfers the preserved frame
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    first_dmg = next(i for i, l in enumerate(lines) if l.startswith("dmg "))
+    check("a direct copy while the panel is off is counted, not stamped, not reported",
+          (d[0]["presents"], d[0]["transferUs"], len(sends(lines[:first_dmg]))), (1, 0, 1))  # the one send so far: the FLAGS_SET reply
+    check("the first refresh once the panel is back transfers the preserved frame: stamped and reported once, with the copy's sequence",
+          (d[1]["transferUs"], sends(lines)[1:]), (1234, [f"send 1 9 {presented(1, 0, 1234).hex()}"]))
+    check("a second stock refresh carries no mark: nothing more is stamped or sent", (d[2]["transferUs"], len(sends(lines))), (1234, 2))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PRESENTED).hex(),
+                 "panel 0", "msg " + kf, "tick 200000", "panel 1", "refresh", "dmg"])
+    check("after a lapse the stock copy clears the mark: the stock refresh that follows is neither stamped nor reported",
+          (dmg(lines)["transferUs"], dmg(lines)["directActive"], len(sends(lines))), (0, 0, 1))
+
+    print("-- the flags at every release point (2026-09-14, second review)")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(),
+                 "tick 200000", "settings " + control(OP_TELEMETRY, 30).hex(),      # the lapse is noticed and settled: flags 0
+                 "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(), "dmg",       # armed again, no lease held
+                 "settings " + FC_RELEASE.hex(), "dmg",                              # FB_RELEASE after the settled lapse
+                 "settings " + control(OP_TELEMETRY, 31).hex()])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("a FLAGS_SET taken after a lapse was settled is in force until the next release point",
+          (sends(lines)[1], d[0]["flags"]), (f"send 1 9 {telemetry(30, 200000, 0, 0, 0, 1).hex()}", FLAG_PROBE))
+    check("FB_RELEASE clears the flags even after a lapse already settled (the settled marker keeps the latch, not the flags)",
+          (d[1]["flags"], sends(lines)[-1]), (0, f"send 1 9 {telemetry(31, 200000, 0, 0, 0, 1).hex()}"))
+    lines = run(["lens R", "tick 5000", "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(), "dmg",
+                 "settings " + FC_ACQUIRE.hex(), "dmg", "settings " + control(OP_TELEMETRY, 32).hex()])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("a FLAGS_SET with no lease ever held is in force, and the fresh acquire that follows clears it",
+          (d[0]["flags"], d[1]["flags"], sends(lines)[-1]), (FLAG_PROBE, 0, f"send 1 9 {telemetry(32, 5000, 0, 0, 90000, 1).hex()}"))
 
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0

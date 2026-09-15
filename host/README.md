@@ -20,7 +20,9 @@ flashed or sent to a device. It is display-rendering test tooling.
   timers, sound, radio and sensors do nothing. The stock senders' lens rule is modeled: a
   message the code sends from the LEFT lens is refused (return 8) and printed by nothing, as
   `FUN_00475b14` does on the glasses; the `dmg` command reads the Damage extension's state from
-  the context instead.
+  the context instead. `panel 0|1` models the display task's panel-on word (a refresh is skipped
+  while it is 0) and `refresh` one stock type-3 refresh with no Damage job pending; the `crc`
+  line also counts calls into the stock BMP loader, which the host refuses.
 - `run_vectors.py` builds the harness and runs the conformance vectors, one process per lens.
 - `test_damage_ext.py` checks `patches/damage_ext.c` (Damage `FIRMWARE.md` §0/§3: DamageCaps, the control
   ops, the telemetry record, flags cleared with the lease, the F1.3 transfer stamp and presented notify,

@@ -26,13 +26,20 @@
  *   control HEX      a sid-0x09 field-101 body (the lease ops)
  *   msg HEX          one completed image message: into buffer B, snapshot, deferred
  *                    handler — the firmware's own entry points — answers "rc N"
- *   crc              answers "crc SHADOW FB presents P gate TAKES/GIVES"
+ *   crc              answers "crc SHADOW FB presents P gate TAKES/GIVES bmp N" (N = calls into the
+ *                    stock BMP loader, which the host refuses)
+ *   panel 0|1        the display task's panel-on word (0x004744a8): while 0, a type-3 refresh runs the
+ *                    copy hook but skips the refresh call, as FUN_00473c44 does
+ *   refresh          one stock type-3 refresh with no Damage job pending: the copy hook's stock path,
+ *                    then the refresh call through damage_refresh_hook (a pass-through unless a mark
+ *                    was left) — the path every stock repaint takes on the glasses
  *   flags            answers "flags reorder skip dup snapof alloc"
  *   settings HEX     a whole sid-0x09 request payload through settings_decode_wrapper
  *   respond HEX      a stock settings response body through settings_send_wrapper
  *   dmg              answers "dmg FLAGS STATUS GEN LATCHED PRESENTS TRANSFER_US ST_SEQ ST_REFUSED
- *                    ST_CRC CACHE" — the Damage extension's state (damage_ext.c), read straight
- *                    from the context: what the left lens holds but cannot report
+ *                    ST_CRC CACHE DIRECT_ACTIVE" — the Damage extension's state (damage_ext.c) and
+ *                    the direct-frame flag, read straight from the context: what the left lens
+ *                    holds but cannot report
  * Every message the patch code sends answers "send TYPE SID HEX" — from the RIGHT lens
  * only: the stock senders refuse on the left lens (FUN_00475b14 -> FUN_0046f258 -> 8), and
  * so does h_send, so a test sees what the phone would.
@@ -84,6 +91,7 @@ void host_damage_state(uint32_t *out);
 #define ZLIB_VER_ADDR     0x0078d654u
 
 static uint32_t lens_side = 1;          /* FW_SIDE(): 1 right, 2 left */
+static int panel_on = 1;                /* the display task's panel-on word (0x004744a8) */
 static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes;
 static uint32_t pool_next = POOL_BASE;
 static uint32_t timer_handles;
@@ -140,8 +148,15 @@ static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
     presents++;
     display_copy_hook();
     gate_gives++;
-    damage_refresh_hook(a, b, c, d, w, hh);
+    if (panel_on) damage_refresh_hook(a, b, c, d, w, hh);   /* 0x00473cca: no refresh while the panel is off */
     return 0;
+}
+/* A stock type-3 refresh (no Damage job pending): the copy hook takes its stock path,
+ * then the refresh call — through the F1.3 site — as for every stock repaint. The stock
+ * gate take/give pair is stock-internal and not counted here. */
+static void h_stock_refresh(void) {
+    display_copy_hook();
+    if (panel_on) damage_refresh_hook(0, 0, 0, 0, 640, 480);
 }
 static void h_display_copy(void) { stock_copies++; }
 static int h_int_void(void) { return 0; }
@@ -272,15 +287,19 @@ int main(void) {
         } else if (!strncmp(line, "crc", 3)) {
             uLong s = crc32(0L, (const Bytef *)(uintptr_t)BUF_A, 153600u);
             uLong f = crc32(0L, (const Bytef *)(uintptr_t)HOST_FB, 153600u);
-            printf("crc %08lx %08lx presents %u gate %u/%u\n", s, f, presents, gate_takes, gate_gives);
+            printf("crc %08lx %08lx presents %u gate %u/%u bmp %u\n", s, f, presents, gate_takes, gate_gives, bmp_calls);
+        } else if (!strncmp(line, "panel ", 6)) {
+            panel_on = line[6] != '0';
+        } else if (!strncmp(line, "refresh", 7)) {
+            h_stock_refresh();
         } else if (!strncmp(line, "flags", 5)) {
             uint8_t fl[5] = {0};
             host_flags(fl);
             printf("flags %u %u %u %u %u\n", fl[0], fl[1], fl[2], fl[3], fl[4]);
         } else if (!strncmp(line, "dmg", 3)) {
-            uint32_t d[10] = {0};
+            uint32_t d[11] = {0};
             host_damage_state(d);
-            printf("dmg %u %u %u %u %u %u %u %u %08x %u\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+            printf("dmg %u %u %u %u %u %u %u %u %08x %u %u\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
         } else if (line[0] != '\n' && line[0] != '#') {
             printf("error unknown command\n");
         }

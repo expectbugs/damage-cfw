@@ -59,10 +59,45 @@ commit.
   (notifies) both call `FUN_0046f258`, which is `FUN_0045a568() == 2` (left), and return 8 without
   sending. Replies and notifies are built on RIGHT only; the left lens runs every op blind, and the
   host harness's `dmg` command reads what it holds. `host/test_damage_ext.py` checks the bytes
-  against the contract (35 checks). Pin with it: **`5ff9159b…`** (2026-09-14 evening; 27 entries;
-  `f9211ea2…` was the morning's build without F1.3/F1.5/the self-test, `b88eb6b9…` the 2026-09-13
-  build). The no-feature baseline (the same sources as the installed image, our clang) is commit
-  `6db86e2`, pin `1920dda6…`.
+  against the contract (44 checks). Pin with it: **`c5e4f8b7…`** (2026-09-14, night, after the
+  second review below; 27 entries, the same one new site; `70e47938…` was the late evening's pin
+  after the first review, `5ff9159b…` the evening's first candidate, `f9211ea2…` the morning's
+  build without F1.3/F1.5/the self-test, `b88eb6b9…` the 2026-09-13 build). The no-feature
+  baseline (the same sources as the installed image, our clang) is commit `6db86e2`, pin `1920dda6…`.
+
+  **Reviewed 2026-09-14, late evening (Damage `HANDOFF.md` §52) — two defects found on the host
+  harness and fixed, one ordering guard added:**
+  - a self-test step carrying a mode-3 or mode-6 message shorter than its own header (alone or as
+    a batch's sub-message) fell through the dispatcher to `load_bmp_fast`, which cleared the live
+    `direct_active` (the next stock repaint would have overwritten the Damage frame) and handed the
+    stack-built container state to the stock BMP loader. `load_bmp_fast` now refuses while a step
+    runs; the step is refused and counted, the scratch and the live frame untouched.
+  - a direct copy whose refresh the display task skipped (panel off, `0x00473cca`) left the F1.3
+    mark set, and a later stock refresh — after a stock copy, with stock content in the
+    framebuffer — was stamped and reported as that Damage frame's transfer. `display_copy_hook`
+    clears the mark on its stock-copy path; the preserved-frame path keeps it (the refresh that
+    follows does transfer the Damage frame).
+  - the self-test's `dmg_st_shadow` / `dmg_st_active` / `dmg_st_free_pending` are volatile: a
+    step marks itself active before it reads the scratch pointer and a release from another task
+    checks the mark before it frees, and the compiler may not reorder either pair. The window
+    between the two is the installed firmware's own for its texture cache.
+  The host harness gained `panel 0|1`, `refresh` and a BMP-loader call count so both defects are
+  pinned by `host/test_damage_ext.py`; Damage's simulator pins the first (`DamageMsgTest`).
+
+  **Reviewed again 2026-09-14, night (Damage `HANDOFF.md` §53) — one contract deviation found on
+  the host harness and fixed, one guard added:**
+  - `damage_lease_ended` returned before clearing the flags once the lapse had been settled, so
+    a FLAGS_SET the glasses took after a settled lapse (no lease held) survived the FB_RELEASE
+    that followed and the next telemetry reply reported it in force. The contract has the flags
+    clear at every release point; the settled marker now keeps only the latch. Damage's model
+    had the same gap and one more (a lease check with no lease cleared the flags, which the C
+    never did); both are fixed and pinned on both sides (three host checks, two `DamageMsgTest`
+    pins). A FLAGS_SET with no lease held is taken and stays in force until the next release
+    point on both sides — whether it should be refused instead is Adam's call (`FIRMWARE.md` §3).
+  - a begin (`[16][0]`) allocated and zeroed the scratch with no active mark, so a release from
+    another task in that time would have freed the scratch under the zeroing; it now runs under
+    the same mark as a step (`damage_self_test_settle` ends both), and a begin the lease ended
+    during is refused with the scratch freed. No observed failure; the window matches the step's.
 
 A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
 image (`*.bin` is ignored by git).
