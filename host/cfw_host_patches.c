@@ -53,4 +53,10 @@ void host_damage_state(uint32_t *out) {
     out[6] = ctx->dmg_st_seq; out[7] = ctx->dmg_st_refused; out[8] = ctx->dmg_st_crc;
     out[9] = ctx->texture_cache != 0;
     out[10] = ctx->direct_active;
+    /* Phase 2 (damage_draw.c): the refusal record, the cache's size, the last transfer's path,
+     * (out[17] is the shim's partial count) and the save-under slots' bytes */
+    out[11] = ctx->dmg_ref_seen; out[12] = ctx->dmg_ref_mode; out[13] = ctx->dmg_ref_reason; out[14] = ctx->dmg_ref_seq;
+    out[15] = ctx->texture_cache ? damage_cache_size(ctx) : 0u;
+    out[16] = ctx->dmg_last_path;
+    out[18] = ctx->dmg_slot_bytes;
 }

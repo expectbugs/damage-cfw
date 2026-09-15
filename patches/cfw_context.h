@@ -46,6 +46,30 @@ typedef struct {
     volatile uint32_t seq; /* push order, or CFW_SNAP_BUSY_SEQ while being consumed */
 } cfw_snap;
 
+/* One save-under slot (Damage FIRMWARE.md §4, mode 23): the captured rect and its pixels
+ * as tight packed rows ((w+1)/2 bytes per row, high nibble = left pixel), from heap 13. */
+#define DMG_SLOTS 4
+typedef struct {
+    uint8_t *buf;        /* 0 = empty */
+    uint16_t l, t, w, h;
+    uint32_t bytes;
+} damage_slot;
+
+/* Reasons of an image-lane refusal (telemetry field 24; Damage FIRMWARE.md §4). */
+#define DMG_REF_LENGTH     1u   /* a message or entry shorter or longer than its shape */
+#define DMG_REF_BOUNDS     2u   /* a rect, box, clip, row range or level outside its range */
+#define DMG_REF_NO_LEASE   3u
+#define DMG_REF_NO_SHADOW  4u   /* no shadow buffer (the container's display allocation) */
+#define DMG_REF_RECORD     5u   /* a cache offset, record or table outside the cache, or a malformed record */
+#define DMG_REF_CODE       6u   /* a string byte that is neither an adjust nor a glyph */
+#define DMG_REF_SCRATCH    7u   /* a save-under slot: out of range, empty on restore, over budget; or the self-test's scratch */
+#define DMG_REF_MODE       8u   /* a mode this build has no handler for, or one not allowed where it sits */
+#define DMG_REF_DRAW2      9u   /* a v2 op while flag bit 2 is not armed */
+#define DMG_REF_NO_BATCH  10u   /* a clip or a present hint outside a batch */
+#define DMG_REF_NO_MEMORY 11u   /* an allocation from heap 13 failed */
+#define DMG_REF_VALUE     12u   /* a sub-op, a LUT, a level or another value outside its range */
+#define DMG_REF_STREAM    13u   /* a zlib or RLE stream that does not decode to its size */
+
 typedef struct {
     uint32_t magic;      /* CFW_CTX_MAGIC when valid */
     /* --- snapshot FIFO: fixes the producer/consumer race on the shared recon buffer.
@@ -156,12 +180,34 @@ typedef struct {
     uint32_t dmg_st_seq;                    /* steps run since the begin */
     uint32_t dmg_st_crc;                    /* CRC-32 of the scratch shadow after the last step */
     damage_diag_state dmg_st_diag;          /* the self-test's fid ring and flags (swapped in per step) */
+    /* --- Damage drawing contract v2 (damage_draw.c; Damage FIRMWARE.md §4, Phase 2).
+     * Appended at the tail so every earlier field offset is unchanged. --- */
+    uint32_t dmg_cache_bytes;               /* op 5 CACHE_SIZE: the size the next allocation takes (0 = the
+                                             * 64 KiB default); the allocated size while the cache is up;
+                                             * reverts to 0 when the cache is released */
+    uint8_t  dmg_ref_seen;                  /* fields 23-25: an image-lane refusal has been recorded */
+    uint8_t  dmg_ref_mode;                  /* the refused message's mode byte, as received */
+    uint8_t  dmg_ref_reason;                /* DMG_REF_* */
+    uint8_t  dmg_last_path;                 /* the last Damage transfer: 0 the full refresh, 1 the partial rows (mode 24) */
+    uint32_t dmg_ref_seq;                   /* dmg_present_seq when the refusal was recorded */
+    damage_slot dmg_slots[DMG_SLOTS];       /* save-under (mode 23): the live session's slots */
+    damage_slot dmg_st_slots[DMG_SLOTS];    /* the self-test's slots, swapped in for a step */
+    uint32_t dmg_slot_bytes;                /* bytes the live slots hold, against DMG_SAVE_BUDGET */
+    uint32_t dmg_st_slot_bytes;
+    /* Mode 24, the present hint: queued with the direct job under the display gate
+     * (present_shadow), latched by the copy hook for the refresh that follows it, consumed
+     * by damage_refresh_hook. Two copies, so a later job's hint cannot reach an earlier
+     * job's refresh (the gate is given back between the copy and the refresh). */
+    uint8_t  dmg_hint_q_on;
+    uint8_t  dmg_hint_r_on;
+    uint16_t dmg_hint_q_y0, dmg_hint_q_y1;
+    uint16_t dmg_hint_r_y0, dmg_hint_r_y1;
 } customCfwContext;
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */
 #define CFW_ALLOC_DIAG_SLOT 0x202a6274U /* second word: magic | sticky failure bit */
 #define CFW_ALLOC_DIAG_MAGIC 0xA110CA7EU
-#define CFW_CTX_MAGIC 0xC0FFEE6AU    /* bumped for the context layout change (Damage Phase 1 fields) */
+#define CFW_CTX_MAGIC 0xC0FFEE6BU    /* bumped for the context layout change (Damage Phase 2 fields) */
 
 #define FW_MS_TICK  (*(volatile uint32_t *)0x20074a34U)  /* firmware 1 ms OS tick (SysTick chain) */
 
@@ -173,3 +219,11 @@ void damage_lease_ended(customCfwContext *ctx);          /* damage_ext.c: a laps
 void damage_lease_fresh_acquire(customCfwContext *ctx);  /* damage_ext.c: FB_ACQUIRE with no live lease */
 void damage_session_cleanup(customCfwContext *ctx);      /* damage_ext.c: mode 11 */
 int  damage_self_test(const uint8_t *src, uint32_t srclen);   /* damage_ext.c: image mode 16 */
+/* damage_draw.c: the drawing contract v2 (Damage FIRMWARE.md §4) */
+void damage_refuse(const uint8_t *src, unsigned reason);      /* record an image-lane refusal (fields 23-25) */
+void damage_clear_refusal(customCfwContext *ctx);             /* mode 7 sub 0 */
+uint32_t damage_cache_size(customCfwContext *ctx);            /* the texture cache's size for this session */
+int  damage_draw2_armed(customCfwContext *ctx);               /* flag bit 2 */
+int  damage_dispatch_v2(uint8_t *state, const uint8_t *src, uint32_t srclen, int present, void *rl);
+void damage_slots_free(damage_slot *slots, uint32_t *bytes);  /* free every slot of a set */
+void damage_slots_swap(customCfwContext *ctx);                /* the self-test's set in, the live one out (and back) */

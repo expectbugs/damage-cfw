@@ -9,9 +9,14 @@ format in Damage's FIRMWARE.md §9); Damage's Kotlin simulator runs the same fil
     python3 host/run_vectors.py --dir PATH v1-cache    # one vector from another directory
 
 Each vector runs once per lens in its own harness process (each lens has its own RAM
-on the glasses). After every step the harness reports the shadow's CRC-32 and the
-return code of every message; --write stores them as the step's expectation:
-    "expect": {"L": "<crc>", "R": "<crc>", "rc": {"L": [..], "R": [..]}}
+on the glasses). After every step the harness reports the shadow's CRC-32, the
+return code of every message, the last image-lane refusal recorded (Damage
+FIRMWARE.md §4, fields 23-25: mode byte, reason, copy sequence; zeros when none) and
+the status register (field 4); --write stores them as the step's expectation:
+    "expect": {"L": "<crc>", "R": "<crc>", "rc": {"L": [..], "R": [..]}, "ref": {"L": [m, r, s, st], "R": [m, r, s, st]}}
+Ops in a step: {"tick": ms}, {"lease": "acquire"|"release"}, {"msg": HEX}, and — Phase 2 —
+{"flags": N} (a FLAGS_SET of the whole set N) and {"cachesize": KiB} (op 5), both sid-0x09
+field-112 requests to the lens.
 Exit status is non-zero on any mismatch, a harness error, or a gate imbalance
 (the display gate must be given back as often as it is taken).
 """
@@ -23,6 +28,11 @@ OBJ = ROOT / "obj"
 BIN = OBJ / "cfw_host"
 DEFAULT_DIR = pathlib.Path.home() / "damagewm/firmware/vectors"
 LEASE_OP = {"acquire": 5, "release": 6}
+
+def damage_control(op, arg):
+    """A sid-0x09 request carrying field 112 ['D','M',1,op,argLo,argHi] (Damage FIRMWARE.md §3)."""
+    body = b"DM" + bytes([1, op, arg & 0xFF, (arg >> 8) & 0xFF])
+    return (bytes([0x08, 1, 0x10, 0]) + bytes([0x82, 0x07, len(body)]) + body).hex()
 
 def build():
     OBJ.mkdir(exist_ok=True)
@@ -54,9 +64,14 @@ def run_lens(vec, lens):
             elif "msg" in op:
                 lines.append(f"msg {op['msg']}")
                 count += 1
+            elif "flags" in op:
+                lines.append("settings " + damage_control(2, int(op["flags"])))
+            elif "cachesize" in op:
+                lines.append("settings " + damage_control(5, int(op["cachesize"])))
             else:
                 sys.exit(f"{vec['name']}: unknown op {op}")
         lines.append("crc")
+        lines.append("dmg")
         per_step_msgs.append(count)
     r = subprocess.run([str(BIN)], input="\n".join(lines) + "\n", capture_output=True, text=True)
     if r.returncode != 0:
@@ -65,22 +80,27 @@ def run_lens(vec, lens):
     errors = [l for l in out if l.startswith("error")]
     if errors:
         sys.exit(f"{vec['name']} lens {lens}: {errors}")
-    crcs, rcs, notes = [], [], []
+    crcs, rcs, refs, notes = [], [], [], []
     it = iter(out)
     for n in per_step_msgs:
         step_rcs = []
         for _ in range(n):
             l = next(it)
+            while l.startswith("send "): l = next(it)      # a control op's reply (RIGHT)
             assert l.startswith("rc "), l
             step_rcs.append(int(l.split()[1]))
         c = next(it).split()
+        while c[0] == "send": c = next(it).split()
         assert c[0] == "crc", c
         takes, gives = map(int, c[6].split("/"))
         if takes != gives:
             notes.append(f"gate taken {takes} times, given {gives}")
+        d = next(it).split()
+        assert d[0] == "dmg", d
         crcs.append(c[1])
         rcs.append(step_rcs)
-    return crcs, rcs, notes
+        refs.append(([int(d[13]), int(d[14]), int(d[15])] if d[12] != "0" else [0, 0, 0]) + [int(d[2])])
+    return crcs, rcs, refs, notes
 
 def main(argv):
     args = list(argv)
@@ -97,11 +117,12 @@ def main(argv):
     for f in files:
         vec = json.loads(f.read_text())
         res = {lens: run_lens(vec, lens) for lens in ("L", "R")}
-        for lens, (_, _, notes) in res.items():
+        for lens, (_, _, _, notes) in res.items():
             for n in notes:
                 print(f"  FAIL  {vec['name']} {lens}: {n}"); bad += 1
         for i, st in enumerate(vec["steps"]):
-            got = {"L": res["L"][0][i], "R": res["R"][0][i], "rc": {"L": res["L"][1][i], "R": res["R"][1][i]}}
+            got = {"L": res["L"][0][i], "R": res["R"][0][i], "rc": {"L": res["L"][1][i], "R": res["R"][1][i]},
+                   "ref": {"L": res["L"][2][i], "R": res["R"][2][i]}}
             if write:
                 st["expect"] = got
             elif st.get("expect") != got:

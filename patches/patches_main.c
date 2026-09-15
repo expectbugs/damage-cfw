@@ -31,5 +31,6 @@
 #include "settings_ext.c"
 #include "mic_control.c"
 #include "damage_ext.c"
+#include "damage_draw.c"
 #include "gesture_fwd.c"
 #include "debug.c"

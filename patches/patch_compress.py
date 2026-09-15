@@ -25,7 +25,14 @@ Build a CFW image for g2_2.2.6.10 with:
   (11) the Damage extension (damage_ext.c, Damage FIRMWARE.md): the settings-channel
       control ops and telemetry on the same seams, a cache that can outlive a lease
       lapse, an image-lane self-test, and ONE new site -- the display task's refresh
-      call, wrapped so the panel transfer of a Damage frame can be timed.
+      call, wrapped so the panel transfer of a Damage frame can be timed, and
+  (12) the Damage drawing contract v2 (damage_draw.c, Damage FIRMWARE.md §4): image-lane
+      modes 17-24 on the seams already hooked (no new site), and the three in-place link
+      edits ported from upstream g2flash c63710c (2.2.9.22) to our 2.2.6.10 sites: the
+      LE 2M feature bit in the startup Set Local Feature command, both fast connection
+      profile records at 7.5 ms / latency 0, and the idle slow request bound to the fast
+      record. Data words and one immediate, no new code; the sites were read at
+      instruction level (Damage HANDOFF.md §58, CLAIMS.md).
 
 REBASED 2.2.4.34 -> 2.2.6.10 (2026-07-16). Every address below was re-derived and
 cross-checked; see notes/fw-2.2.6.10-cfw-rebase.md for the full table and the evidence
@@ -75,6 +82,29 @@ OTA_FLAG_ADDR = 0x007FE000   # OTA magic word (last 8 KB of MRAM)
 MRAM_END      = 0x00800000
 APP_MAX_END   = 0x007F0000   # conservative ceiling: leave the top ~56 KB for NV + flag
 BLOB_ALIGN    = 4            # 4-byte-align each appended blob (Thumb literal pools)
+
+# The link (Damage FIRMWARE.md §4, ported from upstream c63710c; Adam's ruling 2026-09-15).
+# (1) The startup "Set Local Feature" vendor command (opcode 0xfff2) is built in FUN_004b4c8a:
+#     `movs r0,#0x7c; strb r0,[r2,#1]` at 0x4b4c92 -- byte 1 bit 0 is link-layer feature bit 8,
+#     LE 2M PHY. 0x7d sets it, so the phone can request 2M. This immediate runs at boot, the
+#     same class as the arena size below: byte-for-byte upstream's shape on the same pair of
+#     instructions (their 2.2.9.22 site 0x4c6b30 holds the same "7c 20 50 70").
+BLE_2M_SITE = (0x4b4c92, "7c 20 50 70")
+# (2) The two fast connection-profile records (bound by the 0xA3 branch of FUN_004782dc, one or
+#     the other by the state byte FUN_004b8128 reads): +4 min, +6 max in 1.25 ms units (12/24 =
+#     15-30 ms), +8 latency 0, +10 timeout 0x258, +12 retries 5. min = max = 6 is 7.5 ms.
+BLE_FAST_INTERVAL_SITES = {
+    0x784eb4: "0c 00 18 00 00 00 58 02 05 00 00 00",
+    0x784ec4: "0c 00 18 00 00 00 58 02 05 00 00 00",
+}
+# (3) The 0xA4 (idle slow) branch of FUN_004782dc binds the slow record 0x784ea0 (72/84 =
+#     90-105 ms, latency 4) into RAM 0x2007435c through this literal-pool word (its only
+#     reference; `ldr r0,[pc,#0x184]` at 0x478540). Pointing it at the fast record 0x784eb0
+#     makes the 60 s idle timer's request bind the fast set: FUN_00476cbc submits the bound
+#     record's fields, not the mode argument (upstream forces the argument instead; on our base
+#     the argument is not what is submitted).
+BLE_FORCE_FAST_SITE = (0x4786c8, "a0 4e 78 00")
+BLE_FAST_RECORD     = 0x784eb0
 
 # Reserve the final 1 KiB of the stock primary TLSF arena for CFW-owned fixed
 # state. Stock initializes [0x20279670,0x202a6670) with size 0x2d000 at
@@ -304,6 +334,13 @@ def layout(img):
 
     # --- in-place live-code edits + bl retargets (targets are the appended addrs) ---
     in_place = [
+        (g2f(BLE_2M_SITE[0]), BLE_2M_SITE[1], "7d 20",
+         "Set Local Feature: enable LE 2M (link-layer feature bit 8) -- Damage FIRMWARE.md §4"),
+        *[(g2f(site), orig, "06 00 06 00",
+           f"fast connection profile @ {site:#x}: min = max = 6 (7.5 ms); latency stays 0")
+          for site, orig in BLE_FAST_INTERVAL_SITES.items()],
+        (g2f(BLE_FORCE_FAST_SITE[0]), BLE_FORCE_FAST_SITE[1], struct.pack('<I', BLE_FAST_RECORD).hex(),
+         "the 0xA4 idle slow request binds the fast record (pool word 0x4786c8 -> 0x784eb0)"),
         (g2f(PRIMARY_TLSF_SIZE_SITE[0]), PRIMARY_TLSF_SIZE_SITE[1],
          PRIMARY_TLSF_CFW_SIZE,
          "reserve final 1 KiB of primary TLSF arena for CFW context anchor"),

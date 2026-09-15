@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Damage settings extension (patches/damage_ext.c) against Damage FIRMWARE.md §0/§3.
+"""The Damage settings extension (patches/damage_ext.c, damage_draw.c) against Damage FIRMWARE.md §0/§3/§4.
 
 Context: host/README.md. Every expected byte below is written by hand from the
 contract text, not from the C. Runs the x86 host harness; no device involved.
@@ -34,31 +34,37 @@ def ldelim(num, body): return varint((num << 3) | 2) + varint(len(body)) + body
 def control(op, arg): return bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM" + bytes([1, op, arg & 0xFF, arg >> 8]))
 FC_ACQUIRE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 5, 1, 0]))
 FC_RELEASE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 6, 1, 0]))
-OP_TELEMETRY, OP_FLAGS_SET, OP_FLAGS_CLEAR, OP_CACHE_INFO = 1, 2, 3, 4
-FLAG_PRESENTED, FLAG_CACHE_KEEP, FLAG_PROBE = 0x0001, 0x0002, 0x8000
-FEATURES = 0b11111                                      # telemetry, flags, presented, cache-keep, self-test
+OP_TELEMETRY, OP_FLAGS_SET, OP_FLAGS_CLEAR, OP_CACHE_INFO, OP_CACHE_SIZE = 1, 2, 3, 4, 5
+FLAG_PRESENTED, FLAG_CACHE_KEEP, FLAG_DRAW2, FLAG_PROBE = 0x0001, 0x0002, 0x0004, 0x8000
+FEATURES = 0b1111111                                    # telemetry, flags, presented, cache-keep, self-test, v2 drawing, the link
+CONTRACT = 2
 CACHE_SIZE = 65536
 
 def telemetry(req, tick, flags, status, lease_left, lens, worker=0, transfer=0, presents=0, gen=0,
-              cache=False, crc=None, st=None):
-    # §3: 1 id · 2 uptime · 3 flags · 4 the status register · 5 worker µs · 6 copy µs · (7–10 not
-    # known on the host: heap arenas and the panel record are unmapped there) · 11 diagnostics ·
+              cache=False, crc=None, st=None, size=CACHE_SIZE, ref=None, path=0, panel=0x70b024):
+    # §3: 1 id · 2 uptime · 3 flags · 4 the status register · 5 worker µs · 6 copy µs · 10 the panel
+    # record (the host's modeled JBD4010 one) · 11 diagnostics ·
     # 12 lease ms left · (13 boot count: not sent by this build) · 14 lens · 15 last transfer µs ·
     # 16 direct presents · 17 cache generation · 18 cache size when allocated · 19 cache CRC-32
     # (CACHE_INFO only, when allocated) · 20 self-test steps · 21/22 the last step's refusal and
-    # scratch CRC-32 (after a step)
+    # scratch CRC-32 (after a step) · 23/24/25 the last image-lane refusal's mode byte, reason and copy
+    # sequence (once one was recorded) · 26 the last Damage transfer's path (0 full, 1 the partial rows)
+    # (7-9 are not known on the host: the heap arenas are unmapped there; 10 is the modeled JBD4010 record)
     body = (field(1, req) + field(2, tick) + field(3, flags) + field(4, status) + field(5, worker) + field(6, 0)
+            + (field(10, panel) if panel else b"")
             + field(11, 0) + field(12, lease_left) + field(14, lens) + field(15, transfer) + field(16, presents)
             + field(17, gen))
-    if cache: body += field(18, CACHE_SIZE)
+    if cache: body += field(18, size)
     if cache and crc is not None: body += field(19, crc)
     body += field(20, st[0] if st else 0)
     if st: body += field(21, st[1]) + field(22, st[2])
+    if ref: body += field(23, ref[0]) + field(24, ref[1]) + field(25, ref[2])
+    body += field(26, path)
     return bytes([0x08, 3, 0x10, 0]) + ldelim(111, body)
 
-def presented(seq, worker, transfer, lens=1):
-    # field 113 DamagePresented { 1 sequence, 2 worker µs, 3 copy µs, 4 transfer µs, 5 lens }
-    return bytes([0x08, 3, 0x10, 0]) + ldelim(113, field(1, seq) + field(2, worker) + field(3, 0) + field(4, transfer) + field(5, lens))
+def presented(seq, worker, transfer, lens=1, path=0):
+    # field 113 DamagePresented { 1 sequence, 2 worker µs, 3 copy µs, 4 transfer µs, 5 lens, 6 path }
+    return bytes([0x08, 3, 0x10, 0]) + ldelim(113, field(1, seq) + field(2, worker) + field(3, 0) + field(4, transfer) + field(5, lens) + field(6, path))
 
 def keyframe_hex():
     """A real mode-6 keyframe: the first message of the v1-keyframe vector (Damage's inputs)."""
@@ -74,7 +80,8 @@ def sends(lines): return [l for l in lines if l.startswith("send ")]
 def dmg(lines):
     """The last `dmg` line as a dict (host_damage_state's order)."""
     l = [x for x in lines if x.startswith("dmg ")][-1].split()
-    keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache", "directActive"]
+    keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache", "directActive",
+            "refSeen", "refMode", "refReason", "refSeq", "cacheBytes", "lastPath", "partials", "slotBytes"]
     return {k: (int(v, 16) if k == "stCrc" else int(v)) for k, v in zip(keys, l[1:])}
 def rcs(lines): return [int(l.split()[1]) for l in lines if l.startswith("rc ")]
 
@@ -88,9 +95,9 @@ def main():
         fails += not ok
 
     print("-- §0 the capability field")
-    caps = ldelim(110, b"\x0a\x03DMG" + field(2, 1) + field(3, FEATURES))
+    caps = ldelim(110, b"\x0a\x03DMG" + field(2, CONTRACT) + field(3, FEATURES))
     out = sends(run(["lens R", "respond 08021005"]))
-    check("a settings READ response ends with field 110 DamageCaps (contract 1, five features)",
+    check("a settings READ response ends with field 110 DamageCaps (contract 2, seven features)",
           len(out) == 1 and out[0].split()[3].endswith(caps.hex()), True)
     check("the left lens appends the field too, but its response does not leave the glasses",
           sends(run(["lens L", "respond 08021005"])), [])
@@ -219,6 +226,8 @@ def main():
           (rcs(lines)[3], d[2]["stSeq"], d[2]["stRefused"], d[2]["stCrc"] != zero_crc, crc_line[1], crc_line[4], d[2]["presents"]),
           (0, 2, 0, True, f"{zero_crc:08x}", "0", 0))
     check("after end, a step is refused until the next begin", (rcs(lines)[4:], d[3]["stSeq"]), ([0, -1], 2))
+    check("a refused step is also the last image-lane refusal: fields 23-25 name the step's mode and reason (mode 12 as a step: 8); after the end, the scratch (7)",
+          ((d[0]["refMode"], d[0]["refReason"]), (d[1]["refMode"], d[1]["refReason"], d[1]["refSeq"]), (d[3]["refMode"], d[3]["refReason"])), ((16, 3), (12, 8, 0), (16, 7)))
     lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg 1000", "msg 1001" + kf,
                  "settings " + control(OP_TELEMETRY, 12).hex(), "dmg", "tick 200000", "msg 1001" + kf, "dmg"])
     d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
@@ -264,15 +273,88 @@ def main():
                  "settings " + FC_RELEASE.hex(), "dmg",                              # FB_RELEASE after the settled lapse
                  "settings " + control(OP_TELEMETRY, 31).hex()])
     d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
-    check("a FLAGS_SET taken after a lapse was settled is in force until the next release point",
-          (sends(lines)[1], d[0]["flags"]), (f"send 1 9 {telemetry(30, 200000, 0, 0, 0, 1).hex()}", FLAG_PROBE))
-    check("FB_RELEASE clears the flags even after a lapse already settled (the settled marker keeps the latch, not the flags)",
-          (d[1]["flags"], sends(lines)[-1]), (0, f"send 1 9 {telemetry(31, 200000, 0, 0, 0, 1).hex()}"))
+    check("contract 2: a FLAGS_SET after a settled lapse (no lease) is refused with status 3 and arms nothing",
+          (sends(lines)[1], d[0]["flags"], d[0]["status"]), (f"send 1 9 {telemetry(30, 200000, 0, 0, 0, 1).hex()}", 0, 3))
+    check("FB_RELEASE after a settled lapse leaves the flags clear; the register keeps the refusal",
+          (d[1]["flags"], sends(lines)[-1]), (0, f"send 1 9 {telemetry(31, 200000, 0, 3, 0, 1).hex()}"))
     lines = run(["lens R", "tick 5000", "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(), "dmg",
                  "settings " + FC_ACQUIRE.hex(), "dmg", "settings " + control(OP_TELEMETRY, 32).hex()])
     d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
-    check("a FLAGS_SET with no lease ever held is in force, and the fresh acquire that follows clears it",
-          (d[0]["flags"], d[1]["flags"], sends(lines)[-1]), (FLAG_PROBE, 0, f"send 1 9 {telemetry(32, 5000, 0, 0, 90000, 1).hex()}"))
+    check("contract 2: a FLAGS_SET with no lease held is refused with status 3 and arms nothing (Adam's ruling, 2026-09-15)",
+          (d[0]["flags"], d[0]["status"], sends(lines)[0], d[1]["flags"], sends(lines)[-1]),
+          (0, 3, f"send 1 9 {telemetry(0, 5000, 0, 3, 0, 1).hex()}", 0, f"send 1 9 {telemetry(32, 5000, 0, 3, 90000, 1).hex()}"))
+    lines = run(["lens R", "tick 5000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(),
+                 "tick 200000", "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(), "dmg"])
+    check("a FLAGS_SET after an unnoticed lapse is refused the same way (the check settles the lapse first)",
+          (dmg(lines)["flags"], dmg(lines)["status"]), (0, 3))
+
+    print("-- §4 op 5 CACHE_SIZE, the v2 cache write, the refusal record, the partial path (Phase 2)")
+    def v2write(off4, data): return (bytes([19]) + off4.to_bytes(2, "little") + len(data).to_bytes(2, "little") + data).hex()
+    rec = bytes([8, 0, 4, 0]) + bytes([0xFF] * 2)                   # a 8x4 v2 record: 32 pixels of 15 as two 16-runs? no: [cnt|color]: 0xFF = 15 pixels of 15
+    rec = bytes([8, 0, 4, 0]) + bytes([0xFF, 0xFF, 0x2F])            # 15 + 15 + 2 = 32 pixels of level 15
+    lines = run(["lens R", "tick 1000", "settings " + control(OP_CACHE_SIZE, 128).hex(), "dmg",   # no lease: 3
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_CACHE_SIZE, 0).hex(), "dmg",   # zero: 5
+                 "settings " + control(OP_CACHE_SIZE, 161).hex(), "dmg",                           # over budget: 5
+                 "settings " + control(OP_CACHE_SIZE, 128).hex(), "dmg",                           # ok
+                 "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + v2write(20000, rec), "dmg",                                              # 80,000: inside the 128 KiB
+                 "settings " + control(OP_TELEMETRY, 40).hex(),
+                 "settings " + control(OP_CACHE_SIZE, 64).hex(),                                   # allocated: 4
+                 "settings " + control(OP_CACHE_INFO, 41).hex()])
+    out = sends(lines); ds = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]; d = ds[-1]
+    crc128 = zlib.crc32(bytes(80000) + rec + bytes(128 * 1024 - 80000 - len(rec))) & 0xFFFFFFFF
+    check("CACHE_SIZE: status 3 with no lease, 5 for zero and for 161 KiB, 0 for 128 KiB",
+          [x["status"] for x in ds[:4]], [3, 5, 5, 0])
+    check("the first v2 write allocates the 128 KiB and lands at 80,000: TELEMETRY reports the size in field 18",
+          (rcs(lines), d["cacheBytes"], d["gen"], out[5]), ([0], 131072, 1, f"send 1 9 {telemetry(40, 1000, FLAG_DRAW2, 0, 90000, 1, gen=1, cache=True, size=131072).hex()}"))
+    check("CACHE_SIZE once allocated: status 4, the size stands; CACHE_INFO's CRC covers the whole 128 KiB",
+          out[7], f"send 1 9 {telemetry(41, 1000, FLAG_DRAW2, 4, 90000, 1, gen=1, cache=True, size=131072, crc=crc128).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + v2write(20000, rec), "dmg"])
+    check("without op 5 the first write allocates the 64 KiB and a write at 80,000 is refused (reason 5)",
+          (rcs(lines), dmg(lines)["cache"], dmg(lines)["refMode"], dmg(lines)["refReason"]), ([-1], 0, 19, 5))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + v2write(16, rec), "dmg",
+                 "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(), "msg " + v2write(16, rec), "dmg",
+                 "msg " + kf, "msg 15" + "0000" + "0000" + "0800" + "0800" + "0f", "dmg",                 # a fill at (0,0 8x8) level 15
+                 "msg 15" + "0000" + "0000" + "0800" + "0800" + "10", "dmg",                              # level 16: refused 12, seq 2
+                 "settings " + control(OP_TELEMETRY, 42).hex(),
+                 "msg 0700", "dmg"])                                                                     # mode 7 sub 0 clears the record
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("a v2 op with DRAW2 unarmed is refused with reason 9; armed, it runs",
+          ((d[0]["refMode"], d[0]["refReason"]), rcs(lines)[:2], d[1]["gen"]), ((19, 9), [-1, 0], 1))
+    check("a fill presents (a direct frame); a bad level is refused with reason 12 and the copy sequence at the time",
+          (rcs(lines)[2:5], d[2]["presents"], (d[3]["refMode"], d[3]["refReason"], d[3]["refSeq"])), ([0, 0, -1], 2, (21, 12, 2)))
+    check("TELEMETRY carries the refusal (fields 23-25) until mode 7 sub 0 clears it",
+          (sends(lines)[-1], d[4]["refSeen"]),
+          (f"send 1 9 {telemetry(42, 1000, FLAG_DRAW2, 0, 90000, 1, worker=0, transfer=1234, presents=2, gen=1, cache=True, ref=(21, 12, 2)).hex()}", 0))   # worker 0: the refused fill's own dispatch
+    def batch(*subs): return (bytes([8, len(subs)]) + b"".join(len(s).to_bytes(2, "little") + s for s in subs)).hex()
+    hint = lambda y0, y1: bytes([24]) + y0.to_bytes(2, "little") + y1.to_bytes(2, "little")
+    fill = bytes([21]) + bytes([0, 0, 100, 0, 0x80, 2, 40, 0, 6])      # (0,100 640x40) level 6
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2 | FLAG_PRESENTED).hex(),
+                 "msg " + kf, "dmg",
+                 "msg " + batch(hint(100, 139), fill), "dmg",              # rows 100..139 through the partial entry
+                 "msg " + batch(fill), "dmg",                              # no hint: the full refresh
+                 "ops a6ng", "msg " + batch(hint(100, 139), fill), "dmg",  # an A6N-G pair: the full refresh, the entry never called
+                 "ops none", "msg " + batch(hint(100, 139), fill), "dmg",
+                 "settings " + control(OP_TELEMETRY, 43).hex()])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    p = [x for x in sends(lines) if "8a07" in x]
+    check("mode 24 in a batch on a JBD4010 record: the present goes through the partial entry (40 rows: 4,300 µs), path 1; without a hint the full refresh, path 0",
+          ([(x["lastPath"], x["partials"], x["transferUs"]) for x in d[1:3]], rcs(lines)),
+          ([(1, 1, 4300), (0, 1, 1234)], [0, 0, 0, 0, 0]))
+    check("on an A6N-G record, or none, the hint is accepted and the full refresh runs (the record's partial entry is never called)",
+          [(x["lastPath"], x["partials"], x["transferUs"]) for x in d[3:5]], [(0, 1, 1234), (0, 1, 1234)])
+    check("the presented notify carries the path as field 6; TELEMETRY the last one as field 26",
+          (p[1], p[2], sends(lines)[-1].endswith(field(26, 0).hex())),
+          (f"send 1 9 {presented(2, 1234, 4300, path=1).hex()}", f"send 1 9 {presented(3, 4300, 1234).hex()}", True))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "msg " + (bytes([23, 0, 0]) + bytes([0, 0, 100, 0, 0x80, 2, 40, 0])).hex(), "dmg",   # capture slot 0
+                 "tick 200000", "settings " + control(OP_TELEMETRY, 44).hex(), "dmg",                              # the lapse frees it
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + (bytes([23, 1, 0])).hex(), "dmg"])                                                        # restore: empty (7)
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("a save-under slot holds its rect's bytes and is freed at the lease's lapse; a restore after it is refused (7)",
+          (d[0]["slotBytes"], d[1]["slotBytes"], rcs(lines)[-1], (d[2]["refMode"], d[2]["refReason"])), (12800, 0, -1, (23, 7)))
 
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0

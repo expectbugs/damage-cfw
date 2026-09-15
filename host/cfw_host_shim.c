@@ -37,9 +37,17 @@
  *   settings HEX     a whole sid-0x09 request payload through settings_decode_wrapper
  *   respond HEX      a stock settings response body through settings_send_wrapper
  *   dmg              answers "dmg FLAGS STATUS GEN LATCHED PRESENTS TRANSFER_US ST_SEQ ST_REFUSED
- *                    ST_CRC CACHE DIRECT_ACTIVE" — the Damage extension's state (damage_ext.c) and
- *                    the direct-frame flag, read straight from the context: what the left lens
- *                    holds but cannot report
+ *                    ST_CRC CACHE DIRECT_ACTIVE REF_SEEN REF_MODE REF_REASON REF_SEQ CACHE_BYTES
+ *                    LAST_PATH PARTIALS SLOT_BYTES" — the Damage extension's state (damage_ext.c,
+ *                    damage_draw.c) and the direct-frame flag, read straight from the context:
+ *                    what the left lens holds but cannot report. PARTIALS counts the refreshes
+ *                    that went through the modeled JBD4010 partial entry (mode 24).
+ *   ops jbd|a6ng|none
+ *                    the active panel operations record (RAM 0x20074530): the modeled JBD4010
+ *                    record at 0x0070b024 (its +0x28 the full refresh, +0x2c the partial entry —
+ *                    the default), the A6N-G record at 0x0070afe4 (the partial entry must not be
+ *                    called), or none. The modeled partial entry advances the cycle counter by
+ *                    100 µs per row plus 300 µs, so a partial and a full transfer read differently.
  * Every message the patch code sends answers "send TYPE SID HEX" — from the RIGHT lens
  * only: the stock senders refuse on the left lens (FUN_00475b14 -> FUN_0046f258 -> 8), and
  * so does h_send, so a test sees what the phone would.
@@ -92,7 +100,11 @@ void host_damage_state(uint32_t *out);
 
 static uint32_t lens_side = 1;          /* FW_SIDE(): 1 right, 2 left */
 static int panel_on = 1;                /* the display task's panel-on word (0x004744a8) */
-static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes;
+static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes, partial_refreshes;
+static uint32_t partial_last_y0, partial_last_y1;
+#define OPS_JBD4010 0x0070b024u
+#define OPS_A6NG    0x0070afe4u
+#define PANEL_OPS_WORD 0x20074530u
 static uint32_t pool_next = POOL_BASE;
 static uint32_t timer_handles;
 static uint8_t state[0x48];
@@ -141,6 +153,21 @@ static int h_panel_refresh(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
     panel_refreshes++;
     *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * 1234u;   /* DWT CYCCNT: 1,234 µs at 250 cycles/µs */
     return 0;
+}
+/* The JBD4010 record's +0x2c (FUN_00592cb4 on the glasses): (x offset, y offset, x0, y0, x1, y1),
+ * the rows inclusive. Counted, and timed as 100 µs per row plus 300 µs. The A6N-G record's
+ * +0x2c is a trap: the code must never call it (it moves no pixels on the glasses). */
+static int h_panel_partial(uint32_t a, uint32_t b, uint32_t c, uint32_t y0, uint32_t e, uint32_t y1) {
+    (void)a; (void)b; (void)c; (void)e;
+    partial_refreshes++;
+    partial_last_y0 = y0; partial_last_y1 = y1;
+    *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * (100u * (y1 - y0 + 1u) + 300u);
+    return 0;
+}
+static int h_panel_partial_a6ng(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+    fprintf(stderr, "cfw_host: the A6N-G record's partial entry was called\n");
+    exit(3);
 }
 static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t w, uint32_t hh) {
     /* the display task: FUN_00473c44 type 3 runs the copy hook, gives the gate, then
@@ -228,6 +255,10 @@ static void install(void) {
         p[0] = 0xB8; memcpy(p + 1, &to, 4); p[5] = 0xFF; p[6] = 0xE0;   /* mov eax, to; jmp eax */
     }
     memcpy((void *)(uintptr_t)ZLIB_VER_ADDR, "1.1.4", 6);
+    /* the two panel operations records (damage_ext.c reads +0x2c through the active one) */
+    *(uint32_t *)(uintptr_t)(OPS_JBD4010 + 0x2cu) = (uint32_t)(uintptr_t)h_panel_partial;
+    *(uint32_t *)(uintptr_t)(OPS_A6NG + 0x2cu) = (uint32_t)(uintptr_t)h_panel_partial_a6ng;
+    *(uint32_t *)(uintptr_t)PANEL_OPS_WORD = OPS_JBD4010;
     *(uint32_t *)(uintptr_t)FW_DISPLAY_FB_PTR = HOST_FB;
     *(uint8_t **)(uintptr_t)0x200744d0u = (uint8_t *)(uintptr_t)0x20000100u;   /* UI_CTX: any non-null */
     *(uint8_t *)(uintptr_t)0x2034dc30u = 4;                                    /* EVT_SRC: the ring */
@@ -297,9 +328,14 @@ int main(void) {
             host_flags(fl);
             printf("flags %u %u %u %u %u\n", fl[0], fl[1], fl[2], fl[3], fl[4]);
         } else if (!strncmp(line, "dmg", 3)) {
-            uint32_t d[11] = {0};
+            uint32_t d[19] = {0};
             host_damage_state(d);
-            printf("dmg %u %u %u %u %u %u %u %u %08x %u %u\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
+            d[17] = partial_refreshes;
+            printf("dmg %u %u %u %u %u %u %u %u %08x %u %u %u %u %u %u %u %u %u %u\n", d[0], d[1], d[2], d[3], d[4], d[5],
+                   d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18]);
+        } else if (!strncmp(line, "ops ", 4)) {
+            *(uint32_t *)(uintptr_t)PANEL_OPS_WORD = !strncmp(line + 4, "jbd", 3) ? OPS_JBD4010
+                                                   : !strncmp(line + 4, "a6ng", 4) ? OPS_A6NG : 0u;
         } else if (line[0] != '\n' && line[0] != '#') {
             printf("error unknown command\n");
         }

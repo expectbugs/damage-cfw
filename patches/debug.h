@@ -9,8 +9,17 @@ typedef struct { uint16_t l, t, w, h; } cfw_rect;
 typedef struct {
     uint32_t n;
     uint8_t direct_submitted;
+    /* Damage v2 (damage_draw.c): the batch context. A clip (mode 20) the v2 draws, fills and
+     * LUTs after it in the same batch honour, and the present hint (mode 24) the batch's
+     * present carries. Both live here, on the worker's stack, so they end with the batch. */
+    uint8_t clip_on;
+    uint8_t hint_on;
+    uint16_t clip_l, clip_t, clip_r, clip_b;   /* right and bottom exclusive */
+    uint16_t hint_y0, hint_y1;                 /* rows, inclusive */
     cfw_rect r[CFW_RECT_MAX];
 } cfw_rectlist;
+
+static void rl_init(cfw_rectlist *rl);
 
 static void cfw_time_start(uint32_t *t);
 static uint32_t cfw_time_end(const uint32_t *t);

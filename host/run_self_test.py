@@ -11,9 +11,12 @@ through Damage's simulator (`ConformanceVectorTest`, the self-test form).
     python3 host/run_self_test.py                      # every drawing vector, both lenses
     python3 host/run_self_test.py v1-batch v1-copy     # a subset
 
-Vectors that drive the lease or the texture cache (v1-lease, v1-cache) are skipped: the
-self-test needs the lease held throughout, and a step writing the live cache is refused
-by design (only 3/6/8/9/13/14/15 run; 13/14 would read the live cache).
+Vectors that release the lease (v1-lease, v2-cachesize, v2-flags) are skipped: the self-test
+needs the lease held throughout (an acquire inside a vector is fine: the runner holds one). A cache write (mode
+12 or 19) inside a vector is sent as a LIVE message, not a step — a step writing the cache
+is refused by design, and the draws that follow read the live cache (13/14/17/18 do) — so
+its return code is the normal path's and the scratch is untouched. The Phase 2 control ops
+in a vector ({"flags": N}, {"cachesize": KiB}) go to the lens as they do on the normal path.
 """
 import json, pathlib, subprocess, sys, zlib
 
@@ -21,27 +24,38 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import run_vectors
 
-SKIP = {"v1-lease", "v1-cache"}
+SKIP = {"v1-lease"}          # the lapse inside it refuses the step itself, not the message: no self-test form
 ZERO_CRC = f"{zlib.crc32(bytes(153600)) & 0xFFFFFFFF:08x}"
 FC_ACQUIRE = bytes([ord('F'), ord('C'), 1, 5, 1, 0]).hex()
 
 def run_lens(vec, lens):
-    lines = [f"lens {lens}", "tick 1000", "control " + FC_ACQUIRE, "msg 1000", "crc"]
+    lines = [f"lens {lens}", "tick 1000", "control " + FC_ACQUIRE]
+    # the vector's own control ops run before the begin, so DRAW2 and the cache size are in
+    # force for every step, as they are on the normal path (the sim's runner does the same)
+    for st in vec["steps"]:
+        for op in st["ops"]:
+            if "flags" in op: lines.append("settings " + run_vectors.damage_control(2, int(op["flags"])))
+            elif "cachesize" in op: lines.append("settings " + run_vectors.damage_control(5, int(op["cachesize"])))
+            elif "lease" in op and op["lease"] != "acquire": return None    # a release: no self-test form (the runner holds the lease throughout)
+    lines += ["msg 1000", "crc"]
     per_step = []
     for st in vec["steps"]:
         n = 0
         for op in st["ops"]:
             if "msg" in op:
-                lines.append("msg 1001" + op["msg"]); n += 1
+                mode = int(op["msg"][:2], 16) & 0x7f
+                lines.append(("msg " if mode in (12, 19) else "msg 1001") + op["msg"]); n += 1
             elif "tick" in op:
                 lines.append(f"tick {int(op['tick'])}")
+            elif "flags" in op or "cachesize" in op or "lease" in op:
+                pass                                   # sent above (an acquire: the runner holds the lease)
             else:
                 sys.exit(f"{vec['name']}: op {op} has no self-test form")
         lines += ["dmg", "crc"]
         per_step.append(n)
     r = subprocess.run([str(run_vectors.BIN)], input="\n".join(lines) + "\n", capture_output=True, text=True)
     if r.returncode != 0: sys.exit(f"{vec['name']} lens {lens}: harness exited {r.returncode}\n{r.stderr}")
-    out = [l for l in r.stdout.splitlines() if l.strip()]
+    out = [l for l in r.stdout.splitlines() if l.strip() and not l.startswith("send ")]
     it = iter(out)
     begin_rc = next(it); assert begin_rc == "rc 0", begin_rc
     first = next(it).split(); assert first[0] == "crc"
@@ -53,7 +67,8 @@ def run_lens(vec, lens):
             rcs.append(int(l.split()[1]))
         d = next(it).split(); assert d[0] == "dmg", d
         c = next(it).split(); assert c[0] == "crc", c
-        results.append((d[9], rcs, c[1], c[4]))            # scratch crc, rcs, live shadow crc, presents
+        ref = ([int(d[13]), int(d[14]), int(d[15])] if d[12] != "0" else [0, 0, 0]) + [int(d[2])]
+        results.append((d[9], rcs, c[1], c[4], ref))       # scratch crc, rcs, live shadow crc, presents, the refusal record
     return results
 
 def main(argv):
@@ -66,11 +81,15 @@ def main(argv):
         if vec["name"] in SKIP:
             print(f"  skip  {vec['name']} (lease or cache vector)"); continue
         for lens in ("L", "R"):
-            for i, (crc, rcs, live, presents) in enumerate(run_lens(vec, lens)):
+            res = run_lens(vec, lens)
+            if res is None:
+                print(f"  skip  {vec['name']} (a lease release inside it)"); break
+            for i, (crc, rcs, live, presents, ref) in enumerate(res):
                 exp = vec["steps"][i]["expect"]
-                want_crc, want_rc = exp[lens], exp["rc"][lens]
-                if crc != want_crc or rcs != want_rc:
-                    bad += 1; print(f"  FAIL  {vec['name']} step {i} lens {lens}: scratch {crc} rc {rcs}, the normal path gives {want_crc} rc {want_rc}")
+                want_crc, want_rc, want_ref = exp[lens], exp["rc"][lens], exp.get("ref", {}).get(lens)
+                # the refusal's copy sequence (ref[2]) is the live count, 0 here where nothing presents: not compared
+                if crc != want_crc or rcs != want_rc or (want_ref is not None and (ref[0], ref[1], ref[3]) != (want_ref[0], want_ref[1], want_ref[3])):
+                    bad += 1; print(f"  FAIL  {vec['name']} step {i} lens {lens}: scratch {crc} rc {rcs} ref {ref}, the normal path gives {want_crc} rc {want_rc} ref {want_ref}")
                 if live != ZERO_CRC or presents != "0":
                     bad += 1; print(f"  FAIL  {vec['name']} step {i} lens {lens}: the live shadow changed ({live}) or a present happened ({presents})")
         if not bad: print(f"  PASS  {vec['name']}: {len(vec['steps'])} steps through the self-test, both lenses, nothing presented")

@@ -86,7 +86,16 @@
  *                              mode 14; options and clipping also match mode 14.
  *   16          -> [16][sub][...] the Damage self-test (damage_ext.c): drawing messages
  *                              against a scratch shadow, nothing presented.
+ *   17..24      -> the Damage drawing contract v2 (damage_draw.c; Damage FIRMWARE.md §4):
+ *                              17 image draw · 18 string draw over a 224-entry table · 19 cache
+ *                              write with 4-byte-unit offsets · 20 clip (in a batch) · 21 fill ·
+ *                              22 LUT over a rect · 23 save-under · 24 present hint (in a batch).
+ *                              Off until the phone arms flag bit 2 (DRAW2) for the session.
  *   anything else / too short  -> load_bmp_fast (rejects cleanly if not a BMP).
+ *
+ * Every refusal on this lane (v1 modes included) records its mode byte and a reason in the
+ * Damage telemetry record (damage_refuse, fields 23-25): the ack precedes the decode, so a
+ * refusal would otherwise be silent to the phone.
  *
  * The HIGH BIT of the mode byte is a "lenses differ" flag; most modes ignore it. For
  * mode 3 it carries two boxes (left then right, same size) sharing one zlib payload —
@@ -297,7 +306,8 @@ static int is_shadow_message(const uint8_t *src, uint32_t srclen) {
     if (src == 0 || srclen == 0) return 0;
     uint8_t mode = src[0] & 0x7fu;
     return mode == 3 || mode == 6 || mode == 8 || mode == 9 || mode == 11 ||
-           mode == 13 || mode == 14 || mode == 15;
+           mode == 13 || mode == 14 || mode == 15 ||
+           mode == 17 || mode == 18 || mode == 21 || mode == 22 || mode == 23;   /* Damage v2 (damage_draw.c) */
 }
 
 /* The image worker: static, called from image_deferred (the deferred consumer, which
@@ -323,9 +333,8 @@ static int image_worker(void *state_, uint8_t *src, uint32_t srclen) {
 
     /* Time this whole message. The display-task overlay can run before this worker
      * stores the new value, so its worker duration may lag by one update. */
-    cfw_rectlist rl;                               /* per-frame updated-rect list (stack) */
-    rl.n = 0;
-    rl.direct_submitted = 0;
+    cfw_rectlist rl;                               /* per-frame updated-rect list and batch context (stack) */
+    rl_init(&rl);
 
     /* Shadow updates bypass LVGL, but still use the stock display task to refresh
      * the panel. Take its gate before touching the shared shadow and leave it held
@@ -440,6 +449,7 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
                 ctx->last_fid = ctx->high_fid = 0;
                 for (uint32_t i = 0; i < CFW_FID_RING; i++) ctx->recent_fids[i] = 0xffff;
                 ctx->recent_pos = 0;
+                damage_clear_refusal(ctx);                 /* Damage fields 23-25 (damage_draw.c) */
             } else if (sub == 1) {
                 ctx->diag_hide = 1;
             } else if (sub == 2) {
@@ -458,7 +468,7 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
          * event so Faceclaw does not need the stock Navigation app in foreground.
          * This deferred image handler runs on both lenses, but the stock firmware
          * logs that the left arm cannot open the IMU, so invoke it only on right. */
-        if (srclen < 2) return -1;
+        if (srclen < 2) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         customCfwContext *ctx = getCustomCfwContext();
         if (ctx == 0) return -1;
         if (src[1] == 0) {
@@ -474,6 +484,7 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
             }
             return 0;
         }
+        damage_refuse(src, DMG_REF_VALUE);
         return -1;
     }
 
@@ -497,13 +508,19 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
         return damage_self_test(src, srclen);
     }
 
+    if (mode >= 17 && mode <= 24) {
+        /* The Damage drawing contract v2 (damage_draw.c): shadow ops that present at the top
+         * level and mutate only inside a batch, a cache write, and two batch-context ops. */
+        return damage_dispatch_v2(state, src, srclen, present, rl);
+    }
+
     /* Custom shadow geometry is deliberately independent from the EvenHub carrier. */
     uint32_t w = IMAGE_W;
     uint32_t h = IMAGE_H;
 
     if (mode == 13 || mode == 14 || mode == 15) {
         uint8_t *shadow = cfw_shadow_buffer(state);
-        if (shadow == 0) return -1;
+        if (shadow == 0) { damage_refuse(src, DMG_REF_NO_SHADOW); return -1; }
         int r;
         if (mode == 13)
             r = cfw_texture_draw_image(shadow, (w + 1u) >> 1, w, h,
@@ -526,21 +543,24 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
          * Sized no larger than an uncompressed 4bpp logical image; no nesting
          * (a sub-message may not itself be a multi-segment message). Only shadow
          * operations (modes 3/6/9/13/14/15) are accepted. */
-        if (!present) return -1;                       /* only valid at top level */
-        if (srclen < 2) return -1;
+        if (!present) { damage_refuse(src, DMG_REF_MODE); return -1; }   /* only valid at top level */
+        if (srclen < 2) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         uint32_t bmp_max = 118 + ((((w + 1) >> 1) + 3) & ~3u) * h;
-        if (srclen > bmp_max) return -1;
+        if (srclen > bmp_max) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         uint32_t count = src[1];
         uint32_t pos = 2;
         for (uint32_t i = 0; i < count; i++) {
-            if (pos + 2 > srclen) return -1;
+            if (pos + 2 > srclen) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
             uint32_t seglen = rd16(src + pos);
             pos += 2;
-            if (seglen < 1 || pos + seglen > srclen) return -1;
+            if (seglen < 1 || pos + seglen > srclen) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
             uint8_t submode = src[pos] & 0x7fu;
             if (submode != 3 && submode != 6 && submode != 9 &&
-                submode != 13 && submode != 14 && submode != 15) return -1;
-            if (image_dispatch(state, src + pos, seglen, 0, rl) != 0) return -1;
+                submode != 13 && submode != 14 && submode != 15 &&
+                !(submode >= 17 && submode <= 24 && submode != 19)) {   /* Damage v2: all but the cache write */
+                damage_refuse(src, DMG_REF_MODE); return -1;
+            }
+            if (image_dispatch(state, src + pos, seglen, 0, rl) != 0) return -1;   /* the sub-message recorded its reason */
             pos += seglen;
         }
         present_shadow(state, w, h, rl);               /* one atomic present */
@@ -556,22 +576,26 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
          * Pairs with a follow-up delta (usually in one mode-8 message) to scroll. */
         const uint8_t *r = src + 1;
         uint32_t need = lenses_differ ? 32u : 16u;     /* 8 bytes per rect, 2 or 4 rects */
-        if (srclen < 1 + need) return -1;
+        if (srclen < 1 + need) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         if (lenses_differ && FW_SIDE() != 2) r += 16;  /* right lens uses the 2nd set */
         uint32_t sL = rd16(r),     sT = rd16(r + 2),  sW = rd16(r + 4),  sH = rd16(r + 6);
         uint32_t dL = rd16(r + 8), dT = rd16(r + 10), dW = rd16(r + 12), dH = rd16(r + 14);
-        if (sW == 0 || sH == 0 || sW != dW || sH != dH) return -1;    /* copy = same size */
-        if (sL + sW > w || sT + sH > h || dL + dW > w || dT + dH > h) return -1;  /* bounds */
+        if (sW == 0 || sH == 0 || sW != dW || sH != dH) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }   /* copy = same size */
+        if (sL + sW > w || sT + sH > h || dL + dW > w || dT + dH > h) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }  /* bounds */
         uint8_t *shadow = cfw_shadow_buffer(state);
-        if (shadow == 0) return -1;
+        if (shadow == 0) { damage_refuse(src, DMG_REF_NO_SHADOW); return -1; }
         rect_copy_4bpp(shadow, (w + 1) >> 1, sL, sT, dL, dT, sW, sH);
         rl_add(rl, dL, dT, dW, dH);                     /* updated region = destination rect */
         if (present) present_shadow(state, w, h, rl);
         return 0;
     }
 
-    if ((mode != 3 && mode != 6) || srclen < 3)
+    if ((mode != 3 && mode != 6) || srclen < 3) {
+        /* a mode this build has no handler for, or a mode-3/6 message too short for its
+         * header: recorded, then the stock BMP path as before (which refuses a non-BMP) */
+        damage_refuse(src, (mode == 3 || mode == 6) ? DMG_REF_LENGTH : DMG_REF_MODE);
         return load_bmp_fast(state, src, srclen);
+    }
 
     const uint8_t *zsrc = src + 1;
     uint32_t zlen = srclen - 1;
@@ -592,8 +616,8 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
         cfw_diag(0, 0);                               /* keyframe: rebaseline delta fid */
         uint32_t stride = (w + 1) >> 1;                          /* tight 4bpp */
         uint8_t *dst = cfw_shadow_buffer(state);
-        if (dst == 0) return -1;                      /* no shadow allocation -> can't proceed */
-        if (!inflate_rle(strm, dst, stride, stride, h)) return -1;
+        if (dst == 0) { damage_refuse(src, DMG_REF_NO_SHADOW); return -1; }   /* no shadow allocation -> can't proceed */
+        if (!inflate_rle(strm, dst, stride, stride, h)) { damage_refuse(src, DMG_REF_STREAM); return -1; }
         rl_add(rl, 0, 0, w, h);                       /* keyframe updates the whole screen */
         if (present) present_shadow(state, w, h, rl);
         return 0;
@@ -622,13 +646,13 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
          * box — a stereo shift (e.g. a raised dialog) with the pixel data sent once. */
         uint32_t box_off, fid_off, z_off;
         if (lenses_differ) {
-            if (srclen < 12) return -1;               /* mode + 2 boxes + fid + some zlib */
-            if (src[3] != src[7] || src[4] != src[8]) return -1;   /* boxes must match size */
+            if (srclen < 12) { damage_refuse(src, DMG_REF_LENGTH); return -1; }   /* mode + 2 boxes + fid + some zlib */
+            if (src[3] != src[7] || src[4] != src[8]) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }   /* boxes must match size */
             box_off = (FW_SIDE() == 2) ? 1 : 5;       /* left set / right set */
             fid_off = 9;
             z_off   = 11;
         } else {
-            if (srclen < 8) return -1;                /* 4 box hdr + 2 fid + some zlib */
+            if (srclen < 8) { damage_refuse(src, DMG_REF_LENGTH); return -1; }   /* 4 box hdr + 2 fid + some zlib */
             box_off = 1;
             fid_off = 5;
             z_off   = 7;
@@ -638,7 +662,7 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
         uint32_t bw   = (uint32_t)src[box_off + 2] * 4;
         uint32_t bh   = (uint32_t)src[box_off + 3] * 2;
         uint16_t fid  = (uint16_t)rd16(src + fid_off);
-        if (bw == 0 || bh == 0 || left + bw > w || top + bh > h) return -1;
+        if (bw == 0 || bh == 0 || left + bw > w || top + bh > h) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
 
         /* Duplicate frame id (re-processed message) -> skip: re-applying a delta
          * out of order corrupts the shadow. Leaves the current frame on screen. */
@@ -646,7 +670,7 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
 
         uint32_t sstride = (w + 1) >> 1;              /* 4bpp shadow row stride */
         uint8_t *shadow = cfw_shadow_buffer(state);   /* persistent last frame (buffer A) */
-        if (shadow == 0) return -1;                   /* no stable base -> keyframe resyncs */
+        if (shadow == 0) { damage_refuse(src, DMG_REF_NO_SHADOW); return -1; }   /* no stable base -> keyframe resyncs */
         uint32_t rowbytes = bw >> 1;                  /* whole bytes (bw even) */
 
         *(const uint8_t **)(strm + ZS_NEXT_IN) = src + z_off;   /* zlib past box(es) + fid */
@@ -654,14 +678,17 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
         /* Decode the box straight into its slot in the shadow: rows of rowbytes bytes
          * at the shadow's stride. left/bw are multiples of 4 so every row starts (and
          * ends) on a byte boundary. */
-        if (!inflate_rle(strm, shadow + top * sstride + (left >> 1), sstride, rowbytes, bh))
+        if (!inflate_rle(strm, shadow + top * sstride + (left >> 1), sstride, rowbytes, bh)) {
+            damage_refuse(src, DMG_REF_STREAM);
             return -1;                                /* leave the old frame on screen */
+        }
 
         rl_add(rl, left, top, bw, bh);                /* updated region = this lens's box */
         if (present) present_shadow(state, w, h, rl); /* queue one full packed refresh */
         return 0;
     }
 
+    damage_refuse(src, DMG_REF_MODE);
     return -1;
 }
 
@@ -676,11 +703,17 @@ static void present_shadow(uint8_t *state, uint32_t w, uint32_t h, cfw_rectlist 
     if (ctx == 0 || shadow == 0 || w != IMAGE_W || h != IMAGE_H) return;
     if (ctx->dmg_st_active) return;                   /* a self-test step: nothing is published */
 
+    /* Damage mode 24: the batch's present hint rides the job (the worker holds the display
+     * gate until the copy hook consumes both); no hint means the full refresh. */
+    ctx->dmg_hint_q_on = (rl && rl->hint_on) ? 1u : 0u;
+    ctx->dmg_hint_q_y0 = rl ? rl->hint_y0 : 0u;
+    ctx->dmg_hint_q_y1 = rl ? rl->hint_y1 : 0u;
     ctx->direct_shadow = shadow;
     ctx->direct_pending = 1;                          /* publish last */
     if (FW_DISPLAY_QUEUE(0, 0, 0, 0, PANEL_W, PANEL_H) != 0) {
         ctx->direct_pending = 0;
         ctx->direct_shadow = 0;
+        ctx->dmg_hint_q_on = 0;
         return;
     }
     if (rl) rl->direct_submitted = 1;
@@ -911,7 +944,7 @@ void display_copy_hook(void) {
         /* F1.3 (damage_ext.c): the framebuffer is about to hold stock content, so the
          * refresh that follows is not a Damage frame's transfer. A mark left by a direct
          * copy whose refresh the display task skipped (panel off) must not stamp it. */
-        if (ctx) ctx->dmg_direct_presented = 0;
+        if (ctx) { ctx->dmg_direct_presented = 0; ctx->dmg_hint_r_on = 0; ctx->dmg_hint_q_on = 0; }
         FW_DISPLAY_COPY();
         return;
     }
@@ -926,6 +959,12 @@ void display_copy_hook(void) {
         cfw_draw_flags(fb, PANEL_W, PANEL_H);
     }
 
+    /* Damage mode 24: the job's hint is latched for the refresh that follows this copy — a
+     * later job's hint, queued once the gate is given back, waits for its own copy. */
+    ctx->dmg_hint_r_on = ctx->dmg_hint_q_on;
+    ctx->dmg_hint_r_y0 = ctx->dmg_hint_q_y0;
+    ctx->dmg_hint_r_y1 = ctx->dmg_hint_q_y1;
+    ctx->dmg_hint_q_on = 0;
     ctx->direct_pending = 0;                         /* consume before returning gate */
     ctx->direct_shadow = 0;
     if (ok) {
@@ -937,6 +976,7 @@ void display_copy_hook(void) {
     } else {
         ctx->direct_active = 0;
         ctx->direct_failed = 1;
+        ctx->dmg_hint_r_on = 0;
         FW_DISPLAY_COPY();
     }
     ctx->last_present_us = cfw_time_end(&t);

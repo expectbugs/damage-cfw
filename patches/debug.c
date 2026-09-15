@@ -97,6 +97,15 @@ static int cfw_diag(int has_fid, uint16_t fid) {
 }
 
 /* Append (l,t,w,h) to the per-frame updated-rect list, if there's room. */
+static void rl_init(cfw_rectlist *rl) {
+    rl->n = 0;
+    rl->direct_submitted = 0;
+    rl->clip_on = 0;
+    rl->hint_on = 0;
+    rl->clip_l = rl->clip_t = rl->clip_r = rl->clip_b = 0;
+    rl->hint_y0 = rl->hint_y1 = 0;
+}
+
 static void rl_add(cfw_rectlist *rl, uint32_t l, uint32_t t, uint32_t w, uint32_t h) {
     if (rl && rl->n < CFW_RECT_MAX) {
         rl->r[rl->n].l = (uint16_t)l; rl->r[rl->n].t = (uint16_t)t;

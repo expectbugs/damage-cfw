@@ -99,6 +99,24 @@ commit.
     the same mark as a step (`damage_self_test_settle` ends both), and a begin the lease ended
     during is refused with the scratch freed. No observed failure; the window matches the step's.
 
+- **The Phase 2 candidate (2026-09-15 evening, Damage `HANDOFF.md` §60; `FIRMWARE.md` §4), not flashed:**
+  `patches/damage_draw.c` adds image-lane modes 17–24 (a per-lens image draw with u16 dimensions, a string draw
+  over a 224-entry table, a cache write with 4-byte-unit offsets, a clip and a present hint inside a batch, a
+  fill, a LUT over a rect, save-under slots), off until the phone arms flag bit 2; `damage_ext.c` becomes
+  contract 2 (a FLAGS_SET or CACHE_SIZE without the lease is refused, status 3), gains op 5 CACHE_SIZE (up to
+  160 KiB), telemetry fields 23–25 (the last image-lane refusal: mode byte, reason, copy sequence — every refusal
+  on the lane records one, v1 modes included) and 26 (the last transfer's path), and routes a hinted present
+  through the JBD4010 record's per-row partial entry (`+0x2C`, the same six arguments as the async entry) from
+  the Phase 1 refresh hook — no new site. The three link edits ported from upstream `c63710c` to our 2.2.6.10
+  sites (LE 2M in the startup feature command, both fast records at 7.5 ms, the idle slow request bound to the
+  fast record) are in `patch_compress.py`. Pin **`aacdc63a…`** (31 entries, a 57,604-byte block, 23 Thumb
+  branches, 366 KB below the OTA flag; `8fbef73d…` was the candidate before a self-review fix: a release point
+  reached from another task during a self-test step now defers the live save-under slots' free to the step's
+  epilogue, as the scratch's is). The host harness models the JBD4010 and A6N-G records (`ops`), and
+  `test_damage_ext.py` (57 checks), `run_vectors.py` (the `flags`/`cachesize` ops, the `ref` expectation) and
+  `run_self_test.py` (a cache write sent live, the control ops before the begin) cover it; Damage's simulator
+  matches the C on the 11 v2 vectors.
+
 A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
 image (`*.bin` is ignored by git).
 

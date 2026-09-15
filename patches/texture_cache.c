@@ -218,6 +218,7 @@ static void cfw_texture_cache_release(customCfwContext *ctx) {
         ctx->texture_cache = 0;
         cfw_heap13_free(cache);
     }
+    if (ctx) ctx->dmg_cache_bytes = 0;     /* Damage op 5: the size asked for goes with the cache */
 }
 
 /* Mode 12 payload: a list of [offset:u16][length:u16][data...] entries. Validate
@@ -225,28 +226,33 @@ static void cfw_texture_cache_release(customCfwContext *ctx) {
  * the 64 KiB phone-owned region on the first nonempty write. */
 static int cfw_texture_cache_update(const uint8_t *src, uint32_t len) {
     if (src == 0) return -1;
+    const uint8_t *msg = src - 1;                     /* the mode byte, for the refusal record */
     uint32_t pos = 0;
     int has_data = 0;
     while (pos < len) {
-        if (len - pos < 4u) return -1;
+        if (len - pos < 4u) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
         uint32_t offset = rd16(src + pos);
         uint32_t entry_len = rd16(src + pos + 2u);
         pos += 4u;
-        if (entry_len > len - pos || offset + entry_len > CFW_TEXTURE_CACHE_SIZE)
-            return -1;
+        if (entry_len > len - pos) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+        if (offset + entry_len > CFW_TEXTURE_CACHE_SIZE) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         if (entry_len) has_data = 1;
         pos += entry_len;
     }
 
     if (!has_data) return 0;
-    if (!cfw_fb_lease_active()) return -1;
+    if (!cfw_fb_lease_active()) { damage_refuse(msg, DMG_REF_NO_LEASE); return -1; }
     customCfwContext *ctx = getCustomCfwContext();
     if (ctx == 0) return -1;
     if (ctx->texture_cache == 0) {
-        uint8_t *cache = (uint8_t *)cfw_heap13_malloc(CFW_TEXTURE_CACHE_SIZE);
-        if (cache == 0) return -1;
-        bzero(cache, CFW_TEXTURE_CACHE_SIZE);
+        /* Damage op 5 (damage_ext.c): the session's size, 64 KiB unless asked otherwise. The
+         * v1 window this mode and modes 13/14 address stays the first 64 KiB. */
+        uint32_t size = damage_cache_size(ctx);
+        uint8_t *cache = (uint8_t *)cfw_heap13_malloc(size);
+        if (cache == 0) { damage_refuse(msg, DMG_REF_NO_MEMORY); return -1; }
+        bzero(cache, size);
         ctx->texture_cache = cache;
+        ctx->dmg_cache_bytes = size;
     }
 
     pos = 0;
@@ -267,10 +273,13 @@ static int cfw_texture_draw_image(uint8_t *shadow, uint32_t stride,
                                   uint32_t panel_w, uint32_t panel_h,
                                   const uint8_t *src, uint32_t len,
                                   cfw_rectlist *rl) {
-    if (shadow == 0 || src == 0 || len != 7u || !cfw_fb_lease_active()) return -1;
+    const uint8_t *msg = src ? src - 1 : 0;           /* the mode byte, for the refusal record */
+    if (shadow == 0) { damage_refuse(msg, DMG_REF_NO_SHADOW); return -1; }
+    if (src == 0 || len != 7u) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+    if (!cfw_fb_lease_active()) { damage_refuse(msg, DMG_REF_NO_LEASE); return -1; }
     customCfwContext *ctx = getCustomCfwContext();
     cfw_cached_image image;
-    if (!cfw_texture_image_at(ctx, rd16(src), &image)) return -1;
+    if (!cfw_texture_image_at(ctx, rd16(src), &image)) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
     int32_t x = (int32_t)rd16(src + 2);
     int32_t y = (int32_t)rd16(src + 4);
     uint8_t options = src[6];
@@ -289,16 +298,18 @@ static int cfw_texture_draw_string(uint8_t *shadow, uint32_t stride,
                                    uint32_t panel_w, uint32_t panel_h,
                                    const uint8_t *src, uint32_t len,
                                    cfw_rectlist *rl) {
-    if (shadow == 0 || src == 0 || len < 8u || !cfw_fb_lease_active()) return -1;
+    const uint8_t *msg = src ? src - 1 : 0;           /* the mode byte, for the refusal record */
+    if (shadow == 0) { damage_refuse(msg, DMG_REF_NO_SHADOW); return -1; }
+    if (src == 0 || len < 8u) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+    if (!cfw_fb_lease_active()) { damage_refuse(msg, DMG_REF_NO_LEASE); return -1; }
     uint32_t font_offset = rd16(src);
     uint8_t options = src[6];
     uint32_t string_len = src[7];
-    if (len != 8u + string_len ||
-        font_offset > CFW_TEXTURE_CACHE_SIZE - 96u * 2u)
-        return -1;
+    if (len != 8u + string_len) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+    if (font_offset > CFW_TEXTURE_CACHE_SIZE - 96u * 2u) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
 
     customCfwContext *ctx = getCustomCfwContext();
-    if (ctx == 0 || ctx->texture_cache == 0) return -1;
+    if (ctx == 0 || ctx->texture_cache == 0) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
     const uint8_t *table = ctx->texture_cache + font_offset;
     const uint8_t *string = src + 8;
     int32_t x = (int32_t)rd16(src + 2);
@@ -315,10 +326,10 @@ static int cfw_texture_draw_string(uint8_t *shadow, uint32_t stride,
             scan_x += (int32_t)ch - 11;
             continue;
         }
-        if (ch < 32u || ch > 127u) return -1;
+        if (ch < 32u || ch > 127u) { damage_refuse(msg, DMG_REF_CODE); return -1; }
         uint32_t image_offset = rd16(table + (ch - 32u) * 2u);
         cfw_cached_image image;
-        if (!cfw_texture_image_at(ctx, image_offset, &image)) return -1;
+        if (!cfw_texture_image_at(ctx, image_offset, &image)) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         scan_x += (int32_t)image.width;
     }
     (void)scan_x;
@@ -439,15 +450,18 @@ static int cfw_builtin_draw_string(uint8_t *shadow, uint32_t stride,
                                    uint32_t panel_w, uint32_t panel_h,
                                    const uint8_t *src, uint32_t len,
                                    cfw_rectlist *rl) {
-    if (shadow == 0 || src == 0 || len < 6u || !cfw_fb_lease_active()) return -1;
+    const uint8_t *msg = src ? src - 1 : 0;           /* the mode byte, for the refusal record */
+    if (shadow == 0) { damage_refuse(msg, DMG_REF_NO_SHADOW); return -1; }
+    if (src == 0 || len < 6u) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+    if (!cfw_fb_lease_active()) { damage_refuse(msg, DMG_REF_NO_LEASE); return -1; }
     uint32_t string_len = src[5];
-    if (len != 6u + string_len) return -1;
+    if (len != 6u + string_len) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
     const uint8_t *font = CFW_FONT20_ROOT;
-    if (font == 0) return -1;
+    if (font == 0) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
     int32_t line_height = cfw_texture_s32(font + CFW_FONT_LINE_HEIGHT);
     int32_t base_line = cfw_texture_s32(font + CFW_FONT_BASE_LINE);
     if (line_height <= 0 || line_height > 128 ||
-        base_line < -128 || base_line > 128) return -1;
+        base_line < -128 || base_line > 128) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
 
     /* At most one token per input byte. Decode the complete payload before any
      * font calls or shadow writes, preserving all-or-nothing syntax handling. */
@@ -464,7 +478,7 @@ static int cfw_builtin_draw_string(uint8_t *shadow, uint32_t stride,
         }
         uint32_t used, codepoint;
         if (!cfw_texture_utf8(string + pos, string_len - pos,
-                              &used, &codepoint)) return -1;
+                              &used, &codepoint)) { damage_refuse(msg, DMG_REF_CODE); return -1; }
         tokens[token_count++] = codepoint;
         pos += used;
     }
@@ -477,7 +491,7 @@ static int cfw_builtin_draw_string(uint8_t *shadow, uint32_t stride,
         const uint8_t *bitmap;
         if (!cfw_builtin_glyph(font, tokens[i],
                                cfw_texture_next_glyph(tokens, token_count, i),
-                               dsc, &bitmap)) return -1;
+                               dsc, &bitmap)) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         if (bitmap) CFW_FONT_RELEASE(dsc);
     }
 
