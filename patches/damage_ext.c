@@ -113,9 +113,9 @@
  * too short for its own header (the normal path's BMP fallback, load_bmp_fast, refuses
  * while a step runs: the scratch is not a container and the live direct frame is not
  * the step's to drop). [16][2] frees the scratch; so does every lease release point.
- * Both lenses run every step; only RIGHT can report. A step swaps the self-test's save-under
- * slots in for the live ones (damage_draw.c), so a release point reached from another task
- * during a step defers the live slots' free to the step's epilogue as it defers the scratch's.
+ * Both lenses run every step; only RIGHT can report. Mode 23 inside a step takes the self-test's
+ * save-under slots (damage_draw.c picks the set by the active mark; nothing is swapped), so a
+ * release point on another task frees the live set at once and defers only the self-test's.
  */
 
 #define DMG_CAPS_FIELD        110u
@@ -148,6 +148,7 @@
 #define DMG_STATUS_ALLOCATED  4u             /* CACHE_SIZE while the cache is up: the size stands */
 #define DMG_STATUS_BUDGET     5u             /* CACHE_SIZE of zero or over the budget */
 #define DMG_CACHE_BUDGET_KIB  160u           /* budget A (Damage FIRMWARE.md §4) */
+#define DMG_CACHE_MIN_KIB     64u            /* modes 12/13/14 bound their records by the first 64 KiB */
 #define DMG_ST_BEGIN          0u
 #define DMG_ST_STEP           1u
 #define DMG_ST_END            2u
@@ -211,24 +212,22 @@ static void damage_self_test_release(customCfwContext *ctx) {
     damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* the self-test's save-under slots */
 }
 
-/* The live save-under slots are freed at every release point — unless a step is running,
- * when the live set and the self-test's are swapped (damage_slots_swap) and a free from
- * another task would take the step's slots from under it: deferred to the step's epilogue,
- * like the scratch. */
+/* The live save-under slots and the size asked for, at every release point. A step never
+ * touches the live slots (mode 23 takes the self-test's set while one runs), so they are freed
+ * at once; the size asked for goes whether the cache went or was kept by CACHE_KEEP. */
 static void damage_live_slots_release(customCfwContext *ctx) {
-    if (ctx->dmg_st_active) { ctx->dmg_st_free_pending = 1; return; }
     damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
+    ctx->dmg_cache_req = 0;
 }
 
 /* The end of a begin or a step: the active mark drops, and a release that landed
- * from another task meanwhile (deferred above) is honoured now — the scratch, the
- * self-test's slots and the live slots the release point wanted freed. Returns 1 if one had. */
+ * from another task meanwhile (deferred above) is honoured now — the scratch and the
+ * self-test's slots. Returns 1 if one had. */
 static int damage_self_test_settle(customCfwContext *ctx) {
     ctx->dmg_st_active = 0;
     if (!ctx->dmg_st_free_pending) return 0;
     ctx->dmg_st_free_pending = 0;
     damage_self_test_release(ctx);
-    damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
     return 1;
 }
 
@@ -349,10 +348,21 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
         n += damage_put_varint_field(body + n, 21, ctx->dmg_st_refused);
         n += damage_put_varint_field(body + n, 22, ctx->dmg_st_crc);
     }
-    if (ctx->dmg_ref_seen) {                     /* the last image-lane refusal (damage_draw.c) */
-        n += damage_put_varint_field(body + n, 23, ctx->dmg_ref_mode);
-        n += damage_put_varint_field(body + n, 24, ctx->dmg_ref_reason);
-        n += damage_put_varint_field(body + n, 25, ctx->dmg_ref_seq);
+    /* the last image-lane refusal (damage_draw.c), read whole: the image lane may be writing it,
+     * so the fields are taken from an even write count that did not move meanwhile (a few tries;
+     * a record still being rewritten after them is left out of this reply, not sent mixed) */
+    for (unsigned tries = 0; tries < 4u; tries++) {
+        uint32_t gen = ctx->dmg_ref_gen;
+        if (gen & 1u) continue;
+        uint8_t seen = ctx->dmg_ref_seen, mode = ctx->dmg_ref_mode, reason = ctx->dmg_ref_reason;
+        uint32_t seq = ctx->dmg_ref_seq;
+        if (gen != ctx->dmg_ref_gen) continue;
+        if (seen) {
+            n += damage_put_varint_field(body + n, 23, mode);
+            n += damage_put_varint_field(body + n, 24, reason);
+            n += damage_put_varint_field(body + n, 25, seq);
+        }
+        break;
     }
     n += damage_put_varint_field(body + n, 26, ctx->dmg_last_path);
     damage_send_package(ctx->dmg_reply_buf, sizeof(ctx->dmg_reply_buf), DMG_TELEMETRY_FIELD, body, n);
@@ -386,9 +396,9 @@ void damage_apply_control(const uint8_t *data, uint32_t len) {
     } else if (op == DMG_OP_CACHE_SIZE) {
         /* the size the cache is allocated at by its first write; the v1 window stays 64 KiB */
         if (!cfw_fb_lease_active()) ctx->dmg_status = DMG_STATUS_NO_LEASE;
-        else if (arg == 0 || arg > DMG_CACHE_BUDGET_KIB) ctx->dmg_status = DMG_STATUS_BUDGET;
+        else if (arg < DMG_CACHE_MIN_KIB || arg > DMG_CACHE_BUDGET_KIB) ctx->dmg_status = DMG_STATUS_BUDGET;
         else if (ctx->texture_cache) ctx->dmg_status = DMG_STATUS_ALLOCATED;
-        else { ctx->dmg_cache_bytes = arg * 1024u; ctx->dmg_status = DMG_STATUS_OK; }
+        else { ctx->dmg_cache_req = arg * 1024u; ctx->dmg_status = DMG_STATUS_OK; }   /* a request only: the allocation owns the bound */
     } else if (op == DMG_OP_FLAGS_CLEAR) {
         ctx->dmg_flags = 0;
         ctx->dmg_status = DMG_STATUS_OK;
@@ -423,7 +433,8 @@ int damage_refresh_hook(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t
     ctx->dmg_direct_presented = 0;
     /* Mode 24 (F1.7): the hint the copy hook latched for this frame sends rows y0..y1 through
      * the JBD4010's per-row partial entry; any other panel, or no hint, the full refresh. The
-     * arguments are the queued job's (0, 0, 0, 0, 640, 480) with the rows in place of y0/y1. */
+     * arguments are a Damage job's (0, 0, 0, y0, 640, y1) whatever job carries this refresh: a
+     * stock job queues 576x288, and the entry sizes every row from x1 (2026-09-15 review). */
     uint32_t ops = DMG_PANEL_OPS;
     int partial = ctx->dmg_hint_r_on && ops == DMG_PANEL_JBD4010;
     uint32_t y0 = ctx->dmg_hint_r_y0, y1 = ctx->dmg_hint_r_y1;
@@ -433,7 +444,8 @@ int damage_refresh_hook(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t
     int r;
     if (partial) {
         panel_partial_fn part = *(panel_partial_fn *)(uintptr_t)(ops + 0x2cu);
-        r = part(a, b, c, y0, e, y1);
+        (void)a; (void)b; (void)c; (void)e;
+        r = part(0u, 0u, 0u, y0, PANEL_W, y1);
     } else {
         r = FW_PANEL_REFRESH(a, b, c, d, e, f);
     }
@@ -472,7 +484,8 @@ static void damage_diag_reset(damage_diag_state *s) {
  * step, 0 for a begin/end that took effect, -1 for anything refused. */
 int damage_self_test(const uint8_t *src, uint32_t srclen) {
     customCfwContext *ctx = getCustomCfwContext();
-    if (ctx == 0 || src == 0 || srclen < 2u) return -1;
+    if (ctx == 0 || src == 0) return -1;
+    if (srclen < 2u) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
     unsigned sub = src[1];
     if (sub == DMG_ST_BEGIN) {
         if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
@@ -484,7 +497,7 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
         uint8_t *shadow = ctx->dmg_st_shadow;
         if (shadow == 0) {
             shadow = (uint8_t *)cfw_heap13_malloc(DMG_ST_SHADOW_BYTES);
-            if (shadow == 0) { damage_self_test_settle(ctx); return -1; }
+            if (shadow == 0) { damage_self_test_settle(ctx); damage_refuse(src, DMG_REF_NO_MEMORY); return -1; }
             ctx->dmg_st_shadow = shadow;
         }
         bzero(shadow, DMG_ST_SHADOW_BYTES);
@@ -493,7 +506,8 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
         ctx->dmg_st_crc = 0;
         damage_diag_reset(&ctx->dmg_st_diag);
         damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* a begin starts with empty slots */
-        return damage_self_test_settle(ctx) ? -1 : 0;
+        if (damage_self_test_settle(ctx)) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }   /* a release ended it */
+        return 0;
     }
     if (sub == DMG_ST_END) {
         damage_self_test_release(ctx);
@@ -530,9 +544,7 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
         cfw_rectlist rl;
         rl_init(&rl);
         damage_swap_diag(ctx, &ctx->dmg_st_diag);
-        damage_slots_swap(ctx);                      /* the self-test's save-under slots, not the session's */
-        rc = image_dispatch(fake, msg, msglen, 1, &rl);
-        damage_slots_swap(ctx);
+        rc = image_dispatch(fake, msg, msglen, 1, &rl);   /* mode 23 takes the self-test's slots under the mark */
         damage_swap_diag(ctx, &ctx->dmg_st_diag);
     }
     ctx->dmg_st_seq++;

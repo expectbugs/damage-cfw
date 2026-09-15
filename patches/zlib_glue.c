@@ -937,8 +937,13 @@ void display_copy_hook(void) {
     if (ctx == 0 || !ctx->direct_pending || ctx->direct_shadow == 0) {
         if (ctx && ctx->direct_active) {
             uint32_t deadline = ctx->direct_lease_deadline;
-            if (deadline != 0 && (int32_t)(deadline - FW_MS_TICK) > 0)
+            if (deadline != 0 && (int32_t)(deadline - FW_MS_TICK) > 0) {
+                /* Damage mode 24: this refresh sends the preserved frame; a hint latched for a
+                 * direct frame whose own refresh was skipped (the panel off) covers that frame's
+                 * rows only, so it goes and the refresh is full */
+                ctx->dmg_hint_r_on = 0;
                 return;                                  /* preserve the physical direct frame */
+            }
             ctx->direct_active = 0;                       /* fail open to the stock compositor */
         }
         /* F1.3 (damage_ext.c): the framebuffer is about to hold stock content, so the
@@ -960,8 +965,12 @@ void display_copy_hook(void) {
     }
 
     /* Damage mode 24: the job's hint is latched for the refresh that follows this copy — a
-     * later job's hint, queued once the gate is given back, waits for its own copy. */
-    ctx->dmg_hint_r_on = ctx->dmg_hint_q_on;
+     * later job's hint, queued once the gate is given back, waits for its own copy. The rows
+     * cover this frame's changes only: when the previous direct frame was never transferred (its
+     * refresh skipped, the panel off — its mark still stands) or the diagnostic overlay is drawn
+     * into the framebuffer, the refresh is full (2026-09-15 review). */
+    ctx->dmg_hint_r_on = (ctx->dmg_hint_q_on && !ctx->dmg_direct_presented && ctx->diag_hide && !ctx->dmg_overlay_in_fb) ? 1u : 0u;
+    ctx->dmg_overlay_in_fb = ctx->diag_hide ? 0u : 1u;   /* hidden now: once this full refresh sends the frame, the overlay is gone */
     ctx->dmg_hint_r_y0 = ctx->dmg_hint_q_y0;
     ctx->dmg_hint_r_y1 = ctx->dmg_hint_q_y1;
     ctx->dmg_hint_q_on = 0;

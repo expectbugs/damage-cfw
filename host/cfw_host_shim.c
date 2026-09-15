@@ -32,7 +32,13 @@
  *                    copy hook but skips the refresh call, as FUN_00473c44 does
  *   refresh          one stock type-3 refresh with no Damage job pending: the copy hook's stock path,
  *                    then the refresh call through damage_refresh_hook (a pass-through unless a mark
- *                    was left) — the path every stock repaint takes on the glasses
+ *                    was left) with a stock job's arguments (0, 0, 0, 0, 576, 288: FUN_00474066's four
+ *                    callers) — the path every stock repaint takes on the glasses
+ *   partial          answers "partial N XOFF YOFF X0 Y0 X1 Y1": the modeled partial entry's call count
+ *                    and the arguments of its last call
+ *   hold 1|0         1: a queued display job waits (the display task is busy elsewhere), so a stock
+ *                    `refresh` meanwhile is the job whose copy hook takes the pending Damage frame and
+ *                    whose refresh call carries the stock arguments; 0: the held job runs now
  *   flags            answers "flags reorder skip dup snapof alloc"
  *   settings HEX     a whole sid-0x09 request payload through settings_decode_wrapper
  *   respond HEX      a stock settings response body through settings_send_wrapper
@@ -100,8 +106,10 @@ void host_damage_state(uint32_t *out);
 
 static uint32_t lens_side = 1;          /* FW_SIDE(): 1 right, 2 left */
 static int panel_on = 1;                /* the display task's panel-on word (0x004744a8) */
+static int hold_jobs = 0, held_job = 0;
+static uint32_t held_args[6];
 static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes, partial_refreshes;
-static uint32_t partial_last_y0, partial_last_y1;
+static uint32_t partial_last_a, partial_last_b, partial_last_x0, partial_last_y0, partial_last_x1, partial_last_y1;
 #define OPS_JBD4010 0x0070b024u
 #define OPS_A6NG    0x0070afe4u
 #define PANEL_OPS_WORD 0x20074530u
@@ -158,8 +166,8 @@ static int h_panel_refresh(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
  * the rows inclusive. Counted, and timed as 100 µs per row plus 300 µs. The A6N-G record's
  * +0x2c is a trap: the code must never call it (it moves no pixels on the glasses). */
 static int h_panel_partial(uint32_t a, uint32_t b, uint32_t c, uint32_t y0, uint32_t e, uint32_t y1) {
-    (void)a; (void)b; (void)c; (void)e;
     partial_refreshes++;
+    partial_last_a = a; partial_last_b = b; partial_last_x0 = c; partial_last_x1 = e;
     partial_last_y0 = y0; partial_last_y1 = y1;
     *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * (100u * (y1 - y0 + 1u) + 300u);
     return 0;
@@ -172,6 +180,11 @@ static int h_panel_partial_a6ng(uint32_t a, uint32_t b, uint32_t c, uint32_t d, 
 static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t w, uint32_t hh) {
     /* the display task: FUN_00473c44 type 3 runs the copy hook, gives the gate, then
      * (panel on) calls the refresh — through damage_refresh_hook since the F1.3 site */
+    if (hold_jobs) {
+        held_job = 1;
+        held_args[0] = a; held_args[1] = b; held_args[2] = c; held_args[3] = d; held_args[4] = w; held_args[5] = hh;
+        return 0;
+    }
     presents++;
     display_copy_hook();
     gate_gives++;
@@ -183,7 +196,7 @@ static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
  * gate take/give pair is stock-internal and not counted here. */
 static void h_stock_refresh(void) {
     display_copy_hook();
-    if (panel_on) damage_refresh_hook(0, 0, 0, 0, 640, 480);
+    if (panel_on) damage_refresh_hook(0, 0, 0, 0, 576, 288);
 }
 static void h_display_copy(void) { stock_copies++; }
 static int h_int_void(void) { return 0; }
@@ -323,6 +336,15 @@ int main(void) {
             panel_on = line[6] != '0';
         } else if (!strncmp(line, "refresh", 7)) {
             h_stock_refresh();
+        } else if (!strncmp(line, "hold ", 5)) {
+            hold_jobs = line[5] != '0';
+            if (!hold_jobs && held_job) {
+                held_job = 0;
+                h_display_queue(held_args[0], held_args[1], held_args[2], held_args[3], held_args[4], held_args[5]);
+            }
+        } else if (!strncmp(line, "partial", 7)) {
+            printf("partial %u %u %u %u %u %u %u\n", partial_refreshes, partial_last_a, partial_last_b,
+                   partial_last_x0, partial_last_y0, partial_last_x1, partial_last_y1);
         } else if (!strncmp(line, "flags", 5)) {
             uint8_t fl[5] = {0};
             host_flags(fl);

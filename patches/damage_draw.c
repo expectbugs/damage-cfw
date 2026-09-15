@@ -54,6 +54,7 @@
 #define DMG_MODE_HINT      24u
 
 #define DMG_SAVE_BUDGET    (48u * 1024u)   /* the save-under pool, budget A (FIRMWARE.md §4) */
+#define DMG_CACHE_MIN      CFW_TEXTURE_CACHE_SIZE   /* modes 12/13/14 address the first 64 KiB of any cache */
 #define DMG_IMAGE2_MAX_W   640u
 #define DMG_IMAGE2_MAX_H   2048u
 #define DMG_FONT2_CHARS    224u             /* codes 32..255 */
@@ -61,28 +62,39 @@
 
 /* ---- the refusal record (fields 23-25) ------------------------------------------------ */
 
+/* The record is written on the image lane and read by the settings task for telemetry: the
+ * write count goes odd before the fields change and even after, and the reader takes the
+ * fields only from an even count that did not move under it (damage_ext.c). */
 void damage_refuse(const uint8_t *src, unsigned reason) {
     customCfwContext *ctx = peekCustomCfwContext();
     if (ctx == 0) return;
+    ctx->dmg_ref_gen++;
     ctx->dmg_ref_seen = 1;
     ctx->dmg_ref_mode = src ? src[0] : 0xffu;
     ctx->dmg_ref_reason = (uint8_t)reason;
     ctx->dmg_ref_seq = ctx->dmg_present_seq;
+    ctx->dmg_ref_gen++;
 }
 
 void damage_clear_refusal(customCfwContext *ctx) {
     if (ctx == 0) return;
+    ctx->dmg_ref_gen++;
     ctx->dmg_ref_seen = 0;
     ctx->dmg_ref_mode = 0;
     ctx->dmg_ref_reason = 0;
     ctx->dmg_ref_seq = 0;
+    ctx->dmg_ref_gen++;
 }
 
 /* ---- the cache's size and the flag ------------------------------------------------------ */
 
+/* With the cache up: its allocated size (every bound). Without: the size its first write will
+ * allocate — op 5's, never below the 64 KiB the v1 modes' own bounds assume. */
 uint32_t damage_cache_size(customCfwContext *ctx) {
-    if (ctx && ctx->dmg_cache_bytes) return ctx->dmg_cache_bytes;
-    return CFW_TEXTURE_CACHE_SIZE;
+    if (ctx == 0) return CFW_TEXTURE_CACHE_SIZE;
+    if (ctx->texture_cache && ctx->dmg_cache_bytes) return ctx->dmg_cache_bytes;
+    uint32_t req = ctx->dmg_cache_req;
+    return req >= DMG_CACHE_MIN ? req : CFW_TEXTURE_CACHE_SIZE;
 }
 
 int damage_draw2_armed(customCfwContext *ctx) {
@@ -235,6 +247,21 @@ static int damage_read_rect(const uint8_t *p, uint32_t panel_w, uint32_t panel_h
     return 1;
 }
 
+/* The rect this lens takes at `p`: a plain rect, or under the high bit a per-lens pair checked
+ * WHOLE on both lenses first — both rects inside the panel and not empty, one size — so the two
+ * lenses cannot decide the same message differently (the left lens cannot report). 1 when good. */
+static int damage_read_lens_rect(const uint8_t *p, int lenses_differ, uint32_t panel_w, uint32_t panel_h,
+                                 uint32_t *l, uint32_t *t, uint32_t *w, uint32_t *h) {
+    if (!lenses_differ) return damage_read_rect(p, panel_w, panel_h, l, t, w, h);
+    uint32_t l0, t0, w0, h0, l1, t1, w1, h1;
+    if (!damage_read_rect(p, panel_w, panel_h, &l0, &t0, &w0, &h0)) return 0;
+    if (!damage_read_rect(p + 8, panel_w, panel_h, &l1, &t1, &w1, &h1)) return 0;
+    if (w0 != w1 || h0 != h1) return 0;
+    if (FW_SIDE() == 2) { *l = l0; *t = t0; } else { *l = l1; *t = t1; }
+    *w = w0; *h = h0;
+    return 1;
+}
+
 /* ---- save-under slots -------------------------------------------------------------------- */
 
 static void damage_slot_free(damage_slot *s, uint32_t *bytes) {
@@ -251,16 +278,6 @@ void damage_slots_free(damage_slot *slots, uint32_t *bytes) {
     *bytes = 0;
 }
 
-void damage_slots_swap(customCfwContext *ctx) {
-    for (uint32_t i = 0; i < DMG_SLOTS; i++) {
-        damage_slot t = ctx->dmg_slots[i];
-        ctx->dmg_slots[i] = ctx->dmg_st_slots[i];
-        ctx->dmg_st_slots[i] = t;
-    }
-    uint32_t b = ctx->dmg_slot_bytes;
-    ctx->dmg_slot_bytes = ctx->dmg_st_slot_bytes;
-    ctx->dmg_st_slot_bytes = b;
-}
 
 /* ---- the ops ------------------------------------------------------------------------------ */
 
@@ -353,28 +370,36 @@ static int damage_op_string(customCfwContext *ctx, uint8_t *shadow, uint32_t str
  * whole list is checked first and an all-empty list is a no-op; the cache is allocated at
  * the session's size on the first write that carries data. */
 static int damage_op_cache_write(customCfwContext *ctx, const uint8_t *src, uint32_t srclen) {
-    uint32_t size = damage_cache_size(ctx);
+    /* the contract's order: every entry's shape (1), the lease (3), DRAW2 (9), every entry inside the
+     * session's cache (5); a list with no data is then accepted and writes nothing */
     uint32_t pos = 1;
-    int has_data = 0;
     while (pos < srclen) {
         if (srclen - pos < 4u) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
-        uint32_t off = rd16(src + pos) * 4u;
         uint32_t len = rd16(src + pos + 2u);
         pos += 4u;
         if (len > srclen - pos) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
+        pos += len;
+    }
+    if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
+    if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
+    uint32_t size = damage_cache_size(ctx);      /* read after the lease check: a lapse it settled took the size */
+    int has_data = 0;
+    pos = 1;
+    while (pos < srclen) {
+        uint32_t off = rd16(src + pos) * 4u;
+        uint32_t len = rd16(src + pos + 2u);
+        pos += 4u;
         if (off > size || len > size - off) { damage_refuse(src, DMG_REF_RECORD); return -1; }
         if (len) has_data = 1;
         pos += len;
     }
     if (!has_data) return 0;
-    if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
-    if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
     if (ctx->texture_cache == 0) {
         uint8_t *cache = (uint8_t *)cfw_heap13_malloc(size);
         if (cache == 0) { damage_refuse(src, DMG_REF_NO_MEMORY); return -1; }
         bzero(cache, size);
+        ctx->dmg_cache_bytes = size;             /* the allocated size (field 18), before the pointer is published */
         ctx->texture_cache = cache;
-        ctx->dmg_cache_bytes = size;             /* the allocated size, reported as field 18 */
     }
     pos = 1;
     while (pos < srclen) {
@@ -397,10 +422,8 @@ static int damage_op_clip(customCfwContext *ctx, uint32_t panel_w, uint32_t pane
     if (present) { damage_refuse(src, DMG_REF_NO_BATCH); return -1; }
     if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
     if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
-    const uint8_t *p = src + 1;
-    if (lenses_differ && FW_SIDE() != 2) p += 8;
     uint32_t l, t, w, h;
-    if (!damage_read_rect(p, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
+    if (!damage_read_lens_rect(src + 1, lenses_differ, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
     rl->clip_on = 1;
     rl->clip_l = (uint16_t)l; rl->clip_t = (uint16_t)t;
     rl->clip_r = (uint16_t)(l + w); rl->clip_b = (uint16_t)(t + h);
@@ -415,10 +438,8 @@ static int damage_op_fill(customCfwContext *ctx, uint8_t *shadow, uint32_t strid
     if (srclen != need) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
     if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
     if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
-    const uint8_t *p = src + 1;
-    if (lenses_differ && FW_SIDE() != 2) p += 8;
     uint32_t l, t, w, h;
-    if (!damage_read_rect(p, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
+    if (!damage_read_lens_rect(src + 1, lenses_differ, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
     uint32_t level = src[need - 1];
     if (level > 15u) { damage_refuse(src, DMG_REF_VALUE); return -1; }
     damage_clip c = damage_clip_of(rl, panel_w, panel_h);
@@ -446,10 +467,8 @@ static int damage_op_lut(customCfwContext *ctx, uint8_t *shadow, uint32_t stride
     if (srclen != need) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
     if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }
     if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
-    const uint8_t *p = src + 1;
-    if (lenses_differ && FW_SIDE() != 2) p += 8;
     uint32_t l, t, w, h;
-    if (!damage_read_rect(p, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
+    if (!damage_read_lens_rect(src + 1, lenses_differ, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
     const uint8_t *lb = src + need - 8u;
     uint8_t lut[16];
     for (uint32_t i = 0; i < 16u; i++) lut[i] = (i & 1u) ? (uint8_t)(lb[i >> 1] & 0x0fu) : (uint8_t)(lb[i >> 1] >> 4);
@@ -468,6 +487,9 @@ static int damage_op_lut(customCfwContext *ctx, uint8_t *shadow, uint32_t stride
 /* Mode 23: sub 0 [23|80][0][slot][rect (or pair)] capture · sub 1 [23][1][slot] restore at the
  * captured rect · sub 2 [23][2][slot] free (an empty slot is freed silently). Capture into a
  * used slot replaces it. The slots are per lens by construction (each lens runs the op).
+ * While a self-test step runs (dmg_st_active, set by the step on this same task) the op takes
+ * the self-test's set; nothing is swapped, so a release point on another task that frees the
+ * live set can never meet the self-test's slots under its hands (2026-09-15 review).
  * Returns 1 when the shadow changed (a restore), 0 for a capture or a free, -1 refused. */
 static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t stride,
                           uint32_t panel_w, uint32_t panel_h, const uint8_t *src, uint32_t srclen,
@@ -481,8 +503,10 @@ static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t strid
     if (!damage_draw2_armed(ctx)) { damage_refuse(src, DMG_REF_DRAW2); return -1; }
     if (sub > 2u) { damage_refuse(src, DMG_REF_VALUE); return -1; }
     if (slot >= DMG_SLOTS) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }
-    damage_slot *s = &ctx->dmg_slots[slot];
-    if (sub == 2u) { damage_slot_free(s, &ctx->dmg_slot_bytes); return 0; }
+    int st = ctx->dmg_st_active != 0;
+    damage_slot *s = st ? &ctx->dmg_st_slots[slot] : &ctx->dmg_slots[slot];
+    uint32_t *pool = st ? &ctx->dmg_st_slot_bytes : &ctx->dmg_slot_bytes;
+    if (sub == 2u) { damage_slot_free(s, pool); return 0; }
     if (sub == 1u) {
         if (s->buf == 0) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }
         uint32_t rowbytes = ((uint32_t)s->w + 1u) >> 1;
@@ -496,17 +520,15 @@ static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t strid
         rl_add(rl, s->l, s->t, s->w, s->h);
         return 1;
     }
-    const uint8_t *p = src + 3;
-    if (lenses_differ && FW_SIDE() != 2) p += 8;
     uint32_t l, t, w, h;
-    if (!damage_read_rect(p, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
+    if (!damage_read_lens_rect(src + 3, lenses_differ, panel_w, panel_h, &l, &t, &w, &h)) { damage_refuse(src, DMG_REF_BOUNDS); return -1; }
     uint32_t rowbytes = (w + 1u) >> 1;
     uint32_t bytes = rowbytes * h;
-    uint32_t held = ctx->dmg_slot_bytes - (s->buf ? s->bytes : 0u);   /* the slot's own bytes are replaced */
+    uint32_t held = *pool - (s->buf ? s->bytes : 0u);   /* the slot's own bytes are replaced */
     if (held + bytes > DMG_SAVE_BUDGET) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }
     uint8_t *buf = (uint8_t *)cfw_heap13_malloc(bytes);
     if (buf == 0) { damage_refuse(src, DMG_REF_NO_MEMORY); return -1; }
-    damage_slot_free(s, &ctx->dmg_slot_bytes);
+    damage_slot_free(s, pool);
     for (uint32_t y = 0; y < h; y++) {
         uint8_t *row = buf + y * rowbytes;
         for (uint32_t x = 0; x < rowbytes; x++) row[x] = 0;
@@ -519,7 +541,7 @@ static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t strid
     s->buf = buf;
     s->l = (uint16_t)l; s->t = (uint16_t)t; s->w = (uint16_t)w; s->h = (uint16_t)h;
     s->bytes = bytes;
-    ctx->dmg_slot_bytes += bytes;
+    *pool += bytes;
     return 0;
 }
 

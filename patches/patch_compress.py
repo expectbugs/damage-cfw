@@ -98,8 +98,10 @@ BLE_FAST_INTERVAL_SITES = {
     0x784ec4: "0c 00 18 00 00 00 58 02 05 00 00 00",
 }
 # (3) The 0xA4 (idle slow) branch of FUN_004782dc binds the slow record 0x784ea0 (72/84 =
-#     90-105 ms, latency 4) into RAM 0x2007435c through this literal-pool word (its only
-#     reference; `ldr r0,[pc,#0x184]` at 0x478540). Pointing it at the fast record 0x784eb0
+#     90-105 ms, latency 4) into RAM 0x2007435c through this literal-pool word (`ldr r0,[pc,#0x184]`
+#     at 0x478540). The record has one more pool word (0x47775c, FUN_00476db8/FUN_00476fe2), and
+#     FUN_00477adc loads this one too; all three read it for log lines only (Damage CLAIMS.md,
+#     corrected 2026-09-15), so after the edit FUN_00477adc logs the fast values as the slow set. Pointing it at the fast record 0x784eb0
 #     makes the 60 s idle timer's request bind the fast set: FUN_00476cbc submits the bound
 #     record's fields, not the mode argument (upstream forces the argument instead; on our base
 #     the argument is not what is submitted).

@@ -182,16 +182,16 @@ typedef struct {
     damage_diag_state dmg_st_diag;          /* the self-test's fid ring and flags (swapped in per step) */
     /* --- Damage drawing contract v2 (damage_draw.c; Damage FIRMWARE.md §4, Phase 2).
      * Appended at the tail so every earlier field offset is unchanged. --- */
-    uint32_t dmg_cache_bytes;               /* op 5 CACHE_SIZE: the size the next allocation takes (0 = the
-                                             * 64 KiB default); the allocated size while the cache is up;
-                                             * reverts to 0 when the cache is released */
+    uint32_t dmg_cache_bytes;               /* the cache's allocated size while it is up — written before the
+                                             * pointer is published and cleared after it is withdrawn, so a
+                                             * reader that sees the pointer sees its size; 0 otherwise */
     uint8_t  dmg_ref_seen;                  /* fields 23-25: an image-lane refusal has been recorded */
     uint8_t  dmg_ref_mode;                  /* the refused message's mode byte, as received */
     uint8_t  dmg_ref_reason;                /* DMG_REF_* */
     uint8_t  dmg_last_path;                 /* the last Damage transfer: 0 the full refresh, 1 the partial rows (mode 24) */
     uint32_t dmg_ref_seq;                   /* dmg_present_seq when the refusal was recorded */
     damage_slot dmg_slots[DMG_SLOTS];       /* save-under (mode 23): the live session's slots */
-    damage_slot dmg_st_slots[DMG_SLOTS];    /* the self-test's slots, swapped in for a step */
+    damage_slot dmg_st_slots[DMG_SLOTS];    /* the self-test's slots: mode 23 takes these while a step runs */
     uint32_t dmg_slot_bytes;                /* bytes the live slots hold, against DMG_SAVE_BUDGET */
     uint32_t dmg_st_slot_bytes;
     /* Mode 24, the present hint: queued with the direct job under the display gate
@@ -202,6 +202,14 @@ typedef struct {
     uint8_t  dmg_hint_r_on;
     uint16_t dmg_hint_q_y0, dmg_hint_q_y1;
     uint16_t dmg_hint_r_y0, dmg_hint_r_y1;
+    /* Phase 2 review (2026-09-15). */
+    uint32_t dmg_cache_req;                 /* op 5 CACHE_SIZE: the size the next allocation takes (0 = the
+                                             * 64 KiB default); set by the settings task only, cleared at
+                                             * every release point whether a cache was kept or not */
+    volatile uint32_t dmg_ref_gen;          /* the refusal record's write count: odd while the image lane
+                                             * writes fields 23-25, so the settings task never sends a mix */
+    uint8_t  dmg_overlay_in_fb;             /* the last direct copy drew the diagnostic overlay into the
+                                             * framebuffer: the next refresh after it is hidden is full */
 } customCfwContext;
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */
@@ -226,4 +234,3 @@ uint32_t damage_cache_size(customCfwContext *ctx);            /* the texture cac
 int  damage_draw2_armed(customCfwContext *ctx);               /* flag bit 2 */
 int  damage_dispatch_v2(uint8_t *state, const uint8_t *src, uint32_t srclen, int present, void *rl);
 void damage_slots_free(damage_slot *slots, uint32_t *bytes);  /* free every slot of a set */
-void damage_slots_swap(customCfwContext *ctx);                /* the self-test's set in, the live one out (and back) */

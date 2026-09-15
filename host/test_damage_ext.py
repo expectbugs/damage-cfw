@@ -356,6 +356,65 @@ def main():
     check("a save-under slot holds its rect's bytes and is freed at the lease's lapse; a restore after it is refused (7)",
           (d[0]["slotBytes"], d[1]["slotBytes"], rcs(lines)[-1], (d[2]["refMode"], d[2]["refReason"])), (12800, 0, -1, (23, 7)))
 
+    print("-- the Phase 2 review (2026-09-15)")
+    def partial(lines):
+        l = [x for x in lines if x.startswith("partial ")][-1].split()
+        return [int(v) for v in l[1:]]
+    fill_at = lambda y: bytes([21]) + bytes([0, 0, y, 0, 0x80, 2, 10, 0, 6])    # (0,y 640x10) level 6
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf,
+                 "panel 0", "msg " + batch(hint(0, 9), fill_at(0)), "msg " + batch(hint(100, 109), fill_at(100)), "dmg",
+                 "panel 1", "msg " + batch(hint(200, 209), fill_at(200)), "dmg", "partial"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("a hinted frame after frames whose refresh the panel-off path skipped is sent whole: rows 0..9 and 100..109 were never transferred",
+          (d[0]["partials"], d[1]["partials"], d[1]["lastPath"]), (0, 0, 0))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "panel 0", "msg " + batch(hint(300, 309), fill_at(44)), "panel 1", "refresh", "dmg", "partial"])
+    check("the first refresh after the panel is back sends the preserved frame whole, not the skipped frame's hinted rows",
+          (dmg(lines)["partials"], dmg(lines)["lastPath"], dmg(lines)["transferUs"]), (0, 0, 1234))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "msg " + batch(hint(100, 109), fill_at(100)), "partial",
+                 "msg 0702", "msg " + batch(hint(100, 109), fill_at(100)), "partial", "dmg"])
+    p = [[int(v) for v in l.split()[1:]] for l in lines if l.startswith("partial ")]
+    check("the partial entry is called with a Damage job's own arguments (0, 0, 0, y0, 640, y1)", p[0], [1, 0, 0, 0, 100, 640, 109])
+    check("while the diagnostic overlay is drawn into the framebuffer the refresh is full", (p[1][0], dmg(lines)["lastPath"]), (1, 0))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "hold 1", "msg " + batch(hint(100, 109), fill_at(100)), "refresh", "partial", "hold 0", "dmg"])
+    check("a stock job whose copy takes the pending Damage frame still sends whole 640-column rows (its own arguments are 576x288)",
+          partial(lines), [1, 0, 0, 0, 100, 640, 109])
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "msg 0702", "msg " + batch(hint(100, 109), fill_at(100)), "msg 0701",
+                 "msg " + batch(hint(100, 109), fill_at(100)), "partial", "msg " + batch(hint(100, 109), fill_at(100)), "partial"])
+    p = [[int(v) for v in l.split()[1:]] for l in lines if l.startswith("partial ")]
+    check("the first refresh after the overlay is hidden is full (its rows still show it); the one after is partial again",
+          (p[0][0], p[1][0]), (0, 1))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(),
+                 "settings " + control(OP_CACHE_SIZE, 63).hex(), "dmg", "settings " + control(OP_CACHE_SIZE, 64).hex(), "dmg",
+                 "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(), "msg " + v2write(16000, rec), "dmg"])
+    ds = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("CACHE_SIZE below 64 KiB is refused (status 5): modes 12/13/14 bound their records by the first 64 KiB of any cache",
+          (ds[0]["status"], ds[1]["status"], ds[2]["cacheBytes"]), (5, 0, 65536))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(),
+                 "settings " + control(OP_CACHE_SIZE, 128).hex(), "settings " + FC_RELEASE.hex(), "settings " + FC_ACQUIRE.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(), "msg " + v2write(4, rec), "dmg"])
+    check("the size asked for goes at a release point even when CACHE_KEEP is latched and no cache was up",
+          dmg(lines)["cacheBytes"], 65536)
+    lines = run(["lens R", "tick 1000", "msg " + v2write(0xFFFF, rec), "dmg",
+                 "settings " + FC_ACQUIRE.hex(), "msg " + v2write(0xFFFF, rec), "dmg", "msg 13", "dmg"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("mode 19 checks the lease (3) and DRAW2 (9) before an entry past the cache (5); an empty list needs them too",
+          [(x["refMode"], x["refReason"]) for x in d], [(19, 3), (19, 9), (19, 9)])
+    for lens in ("L", "R"):
+        lines = run([f"lens {lens}", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                     "msg " + kf,
+                     "msg " + (bytes([0x95]) + bytes([0, 0, 0, 0, 10, 0, 10, 0]) + bytes([0x7b, 2, 0, 0, 10, 0, 10, 0]) + bytes([7])).hex(), "dmg",
+                     "msg " + (bytes([0x95]) + bytes([0, 0, 0, 0, 10, 0, 10, 0]) + bytes([0, 0, 0, 0, 20, 0, 10, 0]) + bytes([7])).hex(), "dmg"])
+        d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+        check(f"lens {lens}: a per-lens pair is checked whole on both lenses — the right rect past the panel, or two sizes, is refused (2) on this lens too",
+              (rcs(lines)[1:], (d[0]["refMode"], d[0]["refReason"]), (d[1]["refMode"], d[1]["refReason"])), ([-1, -1], (0x95, 2), (0x95, 2)))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg 10", "dmg"])
+    check("a mode-16 message with no sub-op records its refusal (1)", (dmg(lines)["refMode"], dmg(lines)["refReason"]), (16, 1))
+
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0
 

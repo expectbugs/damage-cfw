@@ -218,7 +218,7 @@ static void cfw_texture_cache_release(customCfwContext *ctx) {
         ctx->texture_cache = 0;
         cfw_heap13_free(cache);
     }
-    if (ctx) ctx->dmg_cache_bytes = 0;     /* Damage op 5: the size asked for goes with the cache */
+    if (ctx) ctx->dmg_cache_bytes = 0;     /* after the pointer is withdrawn (Damage op 5: damage_draw.c) */
 }
 
 /* Mode 12 payload: a list of [offset:u16][length:u16][data...] entries. Validate
@@ -251,8 +251,8 @@ static int cfw_texture_cache_update(const uint8_t *src, uint32_t len) {
         uint8_t *cache = (uint8_t *)cfw_heap13_malloc(size);
         if (cache == 0) { damage_refuse(msg, DMG_REF_NO_MEMORY); return -1; }
         bzero(cache, size);
+        ctx->dmg_cache_bytes = size;                  /* before the pointer: a reader that sees it sees its size */
         ctx->texture_cache = cache;
-        ctx->dmg_cache_bytes = size;
     }
 
     pos = 0;

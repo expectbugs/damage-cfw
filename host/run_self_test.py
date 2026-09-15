@@ -76,14 +76,17 @@ def main(argv):
     if argv: files = [f for f in files if f.stem in argv]
     run_vectors.build()
     bad = 0
+    ran = 0
     for f in files:
         vec = json.loads(f.read_text())
         if vec["name"] in SKIP:
             print(f"  skip  {vec['name']} (lease or cache vector)"); continue
+        bad_before = bad
+        skipped = False
         for lens in ("L", "R"):
             res = run_lens(vec, lens)
             if res is None:
-                print(f"  skip  {vec['name']} (a lease release inside it)"); break
+                print(f"  skip  {vec['name']} (a lease release inside it)"); skipped = True; break
             for i, (crc, rcs, live, presents, ref) in enumerate(res):
                 exp = vec["steps"][i]["expect"]
                 want_crc, want_rc, want_ref = exp[lens], exp["rc"][lens], exp.get("ref", {}).get(lens)
@@ -92,8 +95,11 @@ def main(argv):
                     bad += 1; print(f"  FAIL  {vec['name']} step {i} lens {lens}: scratch {crc} rc {rcs} ref {ref}, the normal path gives {want_crc} rc {want_rc} ref {want_ref}")
                 if live != ZERO_CRC or presents != "0":
                     bad += 1; print(f"  FAIL  {vec['name']} step {i} lens {lens}: the live shadow changed ({live}) or a present happened ({presents})")
-        if not bad: print(f"  PASS  {vec['name']}: {len(vec['steps'])} steps through the self-test, both lenses, nothing presented")
-    print(f"RESULT: {bad} mismatch(es)" if bad else "RESULT: the self-test path agrees with the normal path")
+        if skipped: continue                           # a skipped vector ran nothing: no PASS line (2026-09-15 review)
+        ran += 1
+        if bad == bad_before: print(f"  PASS  {vec['name']}: {len(vec['steps'])} steps through the self-test, both lenses, nothing presented")
+    if ran == 0: bad += 1; print("  FAIL  no vector ran through the self-test")
+    print(f"RESULT: {bad} mismatch(es)" if bad else f"RESULT: the self-test path agrees with the normal path ({ran} vectors)")
     return 1 if bad else 0
 
 if __name__ == "__main__":

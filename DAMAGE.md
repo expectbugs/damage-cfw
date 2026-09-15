@@ -109,13 +109,17 @@ commit.
   through the JBD4010 record's per-row partial entry (`+0x2C`, the same six arguments as the async entry) from
   the Phase 1 refresh hook — no new site. The three link edits ported from upstream `c63710c` to our 2.2.6.10
   sites (LE 2M in the startup feature command, both fast records at 7.5 ms, the idle slow request bound to the
-  fast record) are in `patch_compress.py`. Pin **`aacdc63a…`** (31 entries, a 57,604-byte block, 23 Thumb
-  branches, 366 KB below the OTA flag; `8fbef73d…` was the candidate before a self-review fix: a release point
-  reached from another task during a self-test step now defers the live save-under slots' free to the step's
-  epilogue, as the scratch's is). The host harness models the JBD4010 and A6N-G records (`ops`), and
-  `test_damage_ext.py` (57 checks), `run_vectors.py` (the `flags`/`cachesize` ops, the `ref` expectation) and
-  `run_self_test.py` (a cache write sent live, the control ops before the begin) cover it; Damage's simulator
-  matches the C on the 11 v2 vectors.
+  fast record) are in `patch_compress.py`. Pin **`55746389…`** after the review of 2026-09-15 night (Damage
+  `HANDOFF.md` §61; 31 entries, a 53,256-byte block — clang's inlining moved with the changes — 20 Thumb branches,
+  371 KB below the OTA flag; `aacdc63a…` was the candidate before it): op 5 takes 64..160 KiB and a request no longer
+  shares the allocated size's field, a per-lens pair is checked whole on both lenses, mode 19 checks length → lease →
+  DRAW2 → record, mode 23 inside a step picks the self-test's slots by the step's mark (no swap), mode 16 records its
+  refusals, the refusal record is read under a write count, and a hinted present is sent whole after a frame the
+  panel-off path never transferred or while the overlay shows, the partial entry called with (0, 0, 0, y0, 640, y1).
+  The host harness models the JBD4010 and A6N-G records (`ops`), a held display job (`hold`) and the partial call's
+  arguments (`partial`); `test_damage_ext.py` (69 checks), `run_vectors.py` (the `flags`/`cachesize` ops, the `ref`
+  expectation) and `run_self_test.py` (a cache write sent live, the control ops before the begin, no PASS for a
+  skipped vector) cover it; Damage's simulator matches the C on the 13 v2 vectors.
 
 A local convenience: `g2_2.2.6.10.bin` in the repo root may be a symlink to Damage's archived stock
 image (`*.bin` is ignored by git).
