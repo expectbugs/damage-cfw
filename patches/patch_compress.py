@@ -21,7 +21,11 @@ Build a CFW image for g2_2.2.6.10 with:
   (10) a phone-controlled microphone configuration + multi-channel audio streaming
       channel (settings fields 103/104 + the 'SM' stream frame) riding the
       already-hooked sid-0x09 settings seams -- no new patch sites; see
-      mic_control.c for the contract and its hardware validation gate.
+      mic_control.c for the contract and its hardware validation gate, and
+  (11) the Damage extension (damage_ext.c, Damage FIRMWARE.md): the settings-channel
+      control ops and telemetry on the same seams, a cache that can outlive a lease
+      lapse, an image-lane self-test, and ONE new site -- the display task's refresh
+      call, wrapped so the panel transfer of a Damage frame can be timed.
 
 REBASED 2.2.4.34 -> 2.2.6.10 (2026-07-16). Every address below was re-derived and
 cross-checked; see notes/fw-2.2.6.10-cfw-rebase.md for the full table and the evidence
@@ -157,6 +161,13 @@ WEAR_NOTIFY_BL_SITES = {
 # EvenHub active instead, so redirect through a wrapper that preserves the stock call
 # and additionally invokes that notifier while mode 10 owns the compass.
 COMPASS_EVENT_BL_SITE = (0x443288, "1c f0 38 fb")  # bl FUN_0045f8fc(display,0x41,&heading)
+# The display task's type-3 refresh: `bl FUN_004ca564` (the ULED manager's refresh
+# dispatcher; r0-r3 plus two stack words) at 0x473ce4, after the copy hook (0x473c8e)
+# and the gate give (0x473c92). Redirected to damage_refresh_hook, a pass-through
+# for every stock refresh that stamps the transfer of a Damage frame (FIRMWARE.md F1.3).
+# The type-6 case's own call at 0x473d80 is left alone: Damage presents are type 3.
+# Stock bytes read from the image: f056 fc3e (Damage research/fwread.py dis 0x473c44).
+DISPLAY_REFRESH_BL_SITE = (0x473ce4, "56 f0 3e fc")
 
 def enc_bl(pc, target):
     """Encode a Thumb-2 BL (T1) from instruction address `pc` to `target`."""
@@ -266,6 +277,7 @@ def layout(img):
     display_copy_addr = base + _fn(built, "display_copy_hook")["offset"]
     wear_notify_addr = base + _fn(built, "faceclaw_send_wear_event")["offset"]
     compass_event_addr = base + _fn(built, "compass_event_forward")["offset"]
+    refresh_hook_addr = base + _fn(built, "damage_refresh_hook")["offset"]
 
     # --- assemble the appended payload bytes (old_ps .. end) ---
     pad = blob_off - old_ps                     # alignment gap before the blob
@@ -339,6 +351,9 @@ def layout(img):
         (g2f(COMPASS_EVENT_BL_SITE[0]), COMPASS_EVENT_BL_SITE[1],
          enc_bl(COMPASS_EVENT_BL_SITE[0], compass_event_addr),
          "bl compass_event_forward (global IMU heading -> stock nav BLE notifier)"),
+        (g2f(DISPLAY_REFRESH_BL_SITE[0]), DISPLAY_REFRESH_BL_SITE[1],
+         enc_bl(DISPLAY_REFRESH_BL_SITE[0], refresh_hook_addr),
+         "bl damage_refresh_hook @ 0x473ce4 (the panel-transfer stamp of a Damage frame; a pass-through otherwise)"),
     ]
     return bytes(append), in_place, (idx, comp_off, old_ps)
 

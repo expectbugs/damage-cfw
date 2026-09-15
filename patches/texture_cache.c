@@ -258,6 +258,7 @@ static int cfw_texture_cache_update(const uint8_t *src, uint32_t len) {
             ctx->texture_cache[offset + i] = src[pos + i];
         pos += entry_len;
     }
+    ctx->dmg_cache_gen++;                      /* Damage F1.5: the cache's generation */
     return 0;
 }
 

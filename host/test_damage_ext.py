@@ -5,8 +5,16 @@ Context: host/README.md. Every expected byte below is written by hand from the
 contract text, not from the C. Runs the x86 host harness; no device involved.
 
     python3 host/test_damage_ext.py
+
+What the harness models that matters here: only the RIGHT lens sends (the stock
+senders refuse on the left lens — FUN_00475b14 -> FUN_0046f258; h_send does the same),
+so a left-lens check reads the context through `dmg` instead; the display task's
+refresh call advances the cycle counter by 1,234 µs, so the F1.3 stamp is 1,234 here;
+the worker's own stamp brackets the whole dispatch, which on the host includes the
+synchronous refresh, so a presented frame's worker figure reads 1,234 too (on the
+glasses the display task runs on its own; the figure there is the real worker time).
 """
-import pathlib, subprocess, sys
+import json, pathlib, subprocess, sys, zlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -24,19 +32,49 @@ def ldelim(num, body): return varint((num << 3) | 2) + varint(len(body)) + body
 def control(op, arg): return bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM" + bytes([1, op, arg & 0xFF, arg >> 8]))
 FC_ACQUIRE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 5, 1, 0]))
 FC_RELEASE = bytes([0x08, 1, 0x10, 0]) + ldelim(101, b"FC" + bytes([1, 6, 1, 0]))
+OP_TELEMETRY, OP_FLAGS_SET, OP_FLAGS_CLEAR, OP_CACHE_INFO = 1, 2, 3, 4
+FLAG_PRESENTED, FLAG_CACHE_KEEP, FLAG_PROBE = 0x0001, 0x0002, 0x8000
+FEATURES = 0b11111                                      # telemetry, flags, presented, cache-keep, self-test
+CACHE_SIZE = 65536
 
-def telemetry(req, tick, flags, status, lease_left, lens):
+def telemetry(req, tick, flags, status, lease_left, lens, worker=0, transfer=0, presents=0, gen=0,
+              cache=False, crc=None, st=None):
     # §3: 1 id · 2 uptime · 3 flags · 4 the status register · 5 worker µs · 6 copy µs · (7–10 not
     # known on the host: heap arenas and the panel record are unmapped there) · 11 diagnostics ·
-    # 12 lease ms left · (13 boot count: not sent by this build) · 14 lens
-    body = (field(1, req) + field(2, tick) + field(3, flags) + field(4, status) + field(5, 0) + field(6, 0)
-            + field(11, 0) + field(12, lease_left) + field(14, lens))
+    # 12 lease ms left · (13 boot count: not sent by this build) · 14 lens · 15 last transfer µs ·
+    # 16 direct presents · 17 cache generation · 18 cache size when allocated · 19 cache CRC-32
+    # (CACHE_INFO only, when allocated) · 20 self-test steps · 21/22 the last step's refusal and
+    # scratch CRC-32 (after a step)
+    body = (field(1, req) + field(2, tick) + field(3, flags) + field(4, status) + field(5, worker) + field(6, 0)
+            + field(11, 0) + field(12, lease_left) + field(14, lens) + field(15, transfer) + field(16, presents)
+            + field(17, gen))
+    if cache: body += field(18, CACHE_SIZE)
+    if cache and crc is not None: body += field(19, crc)
+    body += field(20, st[0] if st else 0)
+    if st: body += field(21, st[1]) + field(22, st[2])
     return bytes([0x08, 3, 0x10, 0]) + ldelim(111, body)
+
+def presented(seq, worker, transfer, lens=1):
+    # field 113 DamagePresented { 1 sequence, 2 worker µs, 3 copy µs, 4 transfer µs, 5 lens }
+    return bytes([0x08, 3, 0x10, 0]) + ldelim(113, field(1, seq) + field(2, worker) + field(3, 0) + field(4, transfer) + field(5, lens))
+
+def keyframe_hex():
+    """A real mode-6 keyframe: the first message of the v1-keyframe vector (Damage's inputs)."""
+    vec = json.loads((run_vectors.DEFAULT_DIR / "v1-keyframe.json").read_text())
+    return next(op["msg"] for st in vec["steps"] for op in st["ops"] if "msg" in op)
 
 def run(commands):
     r = subprocess.run([str(run_vectors.BIN)], input="\n".join(commands) + "\n", capture_output=True, text=True)
     if r.returncode != 0: sys.exit(f"harness exited {r.returncode}: {r.stderr}")
-    return [l for l in r.stdout.splitlines() if l.startswith("send ")]
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+def sends(lines): return [l for l in lines if l.startswith("send ")]
+def dmg(lines):
+    """The last `dmg` line as a dict (host_damage_state's order)."""
+    l = [x for x in lines if x.startswith("dmg ")][-1].split()
+    keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache"]
+    return {k: (int(v, 16) if k == "stCrc" else int(v)) for k, v in zip(keys, l[1:])}
+def rcs(lines): return [int(l.split()[1]) for l in lines if l.startswith("rc ")]
 
 def main():
     run_vectors.build()
@@ -47,43 +85,144 @@ def main():
         print(f"  {'PASS' if ok else 'FAIL'}  {label}" + ("" if ok else f"\n          got  {got}\n          want {want}"))
         fails += not ok
 
-    caps = ldelim(110, b"\x0a\x03DMG" + field(2, 1) + field(3, 0b11))
-    sends = run(["lens R", "respond 08021005"])
-    check("a settings READ response ends with field 110 DamageCaps",
-          len(sends) == 1 and sends[0].split()[3].endswith(caps.hex()), True)
+    print("-- §0 the capability field")
+    caps = ldelim(110, b"\x0a\x03DMG" + field(2, 1) + field(3, FEATURES))
+    out = sends(run(["lens R", "respond 08021005"]))
+    check("a settings READ response ends with field 110 DamageCaps (contract 1, five features)",
+          len(out) == 1 and out[0].split()[3].endswith(caps.hex()), True)
+    check("the left lens appends the field too, but its response does not leave the glasses",
+          sends(run(["lens L", "respond 08021005"])), [])
 
-    sends = run(["lens R", "tick 5000", "settings " + control(1, 42).hex()])
+    print("-- §3 telemetry, the status register, the flags")
+    out = sends(run(["lens R", "tick 5000", "settings " + control(OP_TELEMETRY, 42).hex()]))
     check("TELEMETRY answers with the record (right lens, no lease)",
-          sends, [f"send 1 9 {telemetry(42, 5000, 0, 0, 0, 1).hex()}"])
+          out, [f"send 1 9 {telemetry(42, 5000, 0, 0, 0, 1).hex()}"])
 
-    sends = run(["lens L", "tick 7000", "settings " + FC_ACQUIRE.hex(), "settings " + control(2, 0x8000).hex(),
-                 "settings " + control(2, 0x0001).hex(),
-                 "tick 17000", "settings " + control(1, 7).hex(),
-                 "tick 200000", "settings " + control(1, 8).hex(),
-                 "settings " + control(3, 0).hex()])
-    check("FLAGS_SET PROBE is armed and echoed (left lens, 90 s lease)",
-          sends[0], f"send 1 9 {telemetry(0, 7000, 0x8000, 0, 90000, 2).hex()}")
+    lines = run(["lens R", "tick 7000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(),
+                 "settings " + control(OP_FLAGS_SET, 0x0100).hex(),
+                 "tick 17000", "settings " + control(OP_TELEMETRY, 7).hex(),
+                 "tick 200000", "settings " + control(OP_TELEMETRY, 8).hex(),
+                 "settings " + control(OP_FLAGS_CLEAR, 0).hex()])
+    out = sends(lines)
+    check("FLAGS_SET PROBE is armed and echoed (90 s lease)",
+          out[0], f"send 1 9 {telemetry(0, 7000, FLAG_PROBE, 0, 90000, 1).hex()}")
     check("FLAGS_SET of an unimplemented bit changes nothing, status 2",
-          sends[1], f"send 1 9 {telemetry(0, 7000, 0x8000, 2, 90000, 2).hex()}")
+          out[1], f"send 1 9 {telemetry(0, 7000, FLAG_PROBE, 2, 90000, 1).hex()}")
     check("flags hold while the lease holds; TELEMETRY reports the last recorded status",
-          sends[2], f"send 1 9 {telemetry(7, 17000, 0x8000, 2, 80000, 2).hex()}")
+          out[2], f"send 1 9 {telemetry(7, 17000, FLAG_PROBE, 2, 80000, 1).hex()}")
     check("a lapsed lease clears the flags, not the status register",
-          sends[3], f"send 1 9 {telemetry(8, 200000, 0, 2, 0, 2).hex()}")
-    check("FLAGS_CLEAR records status 0", sends[4], f"send 1 9 {telemetry(0, 200000, 0, 0, 0, 2).hex()}")
+          out[3], f"send 1 9 {telemetry(8, 200000, 0, 2, 0, 1).hex()}")
+    check("FLAGS_CLEAR records status 0", out[4], f"send 1 9 {telemetry(0, 200000, 0, 0, 0, 1).hex()}")
 
-    sends = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(2, 0x8000).hex(),
-                 "settings " + FC_RELEASE.hex(), "settings " + control(1, 9).hex()])
-    check("FB_RELEASE clears the flags", sends[-1], f"send 1 9 {telemetry(9, 1000, 0, 0, 0, 1).hex()}")
+    lines = run(["lens L", "tick 7000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(),
+                 "dmg", "settings " + control(OP_FLAGS_SET, 0x0100).hex(), "dmg", "tick 200000",
+                 "settings " + control(OP_TELEMETRY, 8).hex(), "dmg"])
+    check("the left lens answers nothing", sends(lines), [])
+    d = [x for x in lines if x.startswith("dmg ")]
+    check("the left lens still arms the flag it was written (read from its context)",
+          (d[0].split()[1], d[0].split()[2]), (str(FLAG_PROBE), "0"))
+    check("and records the refusal of an unimplemented bit", (d[1].split()[1], d[1].split()[2]), (str(FLAG_PROBE), "2"))
+    check("and clears its flags at the lapse, keeping the register", (d[2].split()[1], d[2].split()[2]), ("0", "2"))
+
+    out = sends(run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PROBE).hex(),
+                     "settings " + FC_RELEASE.hex(), "settings " + control(OP_TELEMETRY, 9).hex()]))
+    check("FB_RELEASE clears the flags", out[-1], f"send 1 9 {telemetry(9, 1000, 0, 0, 0, 1).hex()}")
 
     short = bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"DM\x01\x01\x2a")
     marker = bytes([0x08, 1, 0x10, 0]) + ldelim(112, b"XM\x01\x01\x2a\x00")
-    sends = run(["lens R", "settings " + short.hex(), "settings " + marker.hex()])
-    check("a body of the wrong length or marker gets no answer", sends, [])
-    sends = run(["lens R", "settings " + marker.hex(), "settings " + control(1, 11).hex()])
+    out = sends(run(["lens R", "settings " + short.hex(), "settings " + marker.hex()]))
+    check("a body of the wrong length or marker gets no answer", out, [])
+    out = sends(run(["lens R", "settings " + marker.hex(), "settings " + control(OP_TELEMETRY, 11).hex()]))
     check("an unanswered malformed body is recorded: the next TELEMETRY reports status 1",
-          sends, [f"send 1 9 {telemetry(11, 0, 0, 1, 0, 1).hex()}"])
-    sends = run(["lens R", "settings " + control(9, 0).hex()])
-    check("an unknown op is answered, status 1", sends, [f"send 1 9 {telemetry(0, 0, 0, 1, 0, 1).hex()}"])
+          out, [f"send 1 9 {telemetry(11, 0, 0, 1, 0, 1).hex()}"])
+    out = sends(run(["lens R", "settings " + control(9, 0).hex()]))
+    check("an unknown op is answered, status 1", out, [f"send 1 9 {telemetry(0, 0, 0, 1, 0, 1).hex()}"])
+
+    print("-- F1.3 the panel-transfer stamp and the presented notify")
+    kf = keyframe_hex()
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + kf, "dmg",
+                 "settings " + control(OP_TELEMETRY, 1).hex()])
+    d = dmg(lines)
+    check("a presented keyframe is counted and its transfer stamped, with no notify while unarmed",
+          (d["presents"], d["transferUs"], len(sends(lines))), (1, 1234, 1))
+    check("TELEMETRY carries the stamp and the count (fields 15/16; the worker figure is the host's, see the docstring)",
+          sends(lines)[-1], f"send 1 9 {telemetry(1, 1000, 0, 0, 90000, 1, worker=1234, transfer=1234, presents=1).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PRESENTED).hex(),
+                 "msg " + kf, "msg " + kf])
+    out = sends(lines)
+    check("PRESENTED armed: a field-113 notify follows each transfer (the worker figure lags one frame)",
+          out[1:], [f"send 1 9 {presented(1, 0, 1234).hex()}", f"send 1 9 {presented(2, 1234, 1234).hex()}"])
+    lines = run(["lens L", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_PRESENTED).hex(),
+                 "msg " + kf, "dmg"])
+    check("the left lens stamps its own transfer but sends nothing", (dmg(lines)["transferUs"], sends(lines)), (1234, []))
+
+    print("-- F1.5 cache generation, CRC and cache-keep")
+    data = bytes(range(256)) * 4
+    write = bytes([12]) + (0).to_bytes(2, "little") + len(data).to_bytes(2, "little") + data
+    cache_crc = zlib.crc32(data + bytes(CACHE_SIZE - len(data))) & 0xFFFFFFFF
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_TELEMETRY, 3).hex(), "settings " + control(OP_CACHE_INFO, 4).hex()])
+    out = sends(lines)
+    check("a cache write bumps the generation; TELEMETRY reports size, not the CRC",
+          out[0], f"send 1 9 {telemetry(3, 1000, 0, 0, 90000, 1, gen=1, cache=True).hex()}")
+    check("CACHE_INFO adds the CRC-32 of the whole cache (zlib polynomial)",
+          out[1], f"send 1 9 {telemetry(4, 1000, 0, 0, 90000, 1, gen=1, cache=True, crc=cache_crc).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(),
+                 "tick 200000", "settings " + control(OP_TELEMETRY, 5).hex(), "dmg",
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_CACHE_INFO, 6).hex(), "dmg",
+                 "tick 400000", "settings " + control(OP_TELEMETRY, 7).hex()])
+    out = sends(lines); d = [x for x in lines if x.startswith("dmg ")]
+    check("CACHE_KEEP armed: the lapse clears the flags and keeps the cache (the keep is latched)",
+          (out[1], d[0].split()[4]), (f"send 1 9 {telemetry(5, 200000, 0, 0, 0, 1, gen=1, cache=True).hex()}", "1"))
+    check("the fresh acquire after the lapse carries the cache over, same generation and CRC; the latch is spent",
+          (out[2], d[1].split()[4]), (f"send 1 9 {telemetry(6, 200000, 0, 0, 90000, 1, gen=1, cache=True, crc=cache_crc).hex()}", "0"))
+    check("not re-armed: the next lapse frees the cache (upstream's rule)",
+          out[3], f"send 1 9 {telemetry(7, 400000, 0, 0, 0, 1, gen=1).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(), "tick 200000",
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_CACHE_INFO, 8).hex()])
+    check("a lapse nobody noticed before the fresh acquire is settled the same way",
+          sends(lines)[-1], f"send 1 9 {telemetry(8, 200000, 0, 0, 90000, 1, gen=1, cache=True, crc=cache_crc).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(),
+                 "settings " + FC_RELEASE.hex(), "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_TELEMETRY, 9).hex()])
+    check("FB_RELEASE under CACHE_KEEP keeps the cache for the next acquire too",
+          sends(lines)[-1], f"send 1 9 {telemetry(9, 1000, 0, 0, 90000, 1, gen=1, cache=True).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(), "msg 0b",
+                 "settings " + control(OP_TELEMETRY, 10).hex()])
+    check("mode 11 (the hand-back to stock) frees the cache regardless",
+          sends(lines)[-1], f"send 1 9 {telemetry(10, 1000, 0, 0, 0, 1, gen=1).hex()}")
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg " + write.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_CACHE_KEEP).hex(),
+                 "tick 200000", "settings " + control(OP_TELEMETRY, 21).hex(),     # the lapse is noticed and settled
+                 "settings " + FC_RELEASE.hex(),                                    # a release after it: settled once, the latch stands
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_CACHE_INFO, 22).hex()])
+    check("a release after a lapse already settled does not drop the latch: the cache still carries over",
+          sends(lines)[-1], f"send 1 9 {telemetry(22, 200000, 0, 0, 90000, 1, gen=1, cache=True, crc=cache_crc).hex()}")
+
+    print("-- the self-test (mode 16)")
+    zero_crc = zlib.crc32(bytes(153600)) & 0xFFFFFFFF
+    lines = run(["lens R", "tick 1000", "msg 1000", "settings " + FC_ACQUIRE.hex(), "msg 1000", "dmg",
+                 "msg 1001" + "0c" + "0000" + "0100" + "aa", "dmg",          # a step carrying a mode-12 write: refused
+                 "msg 1001" + kf, "dmg", "crc",
+                 "msg 1002", "msg 1001" + kf, "dmg"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    crc_line = [l for l in lines if l.startswith("crc ")][0].split()
+    check("begin needs the lease", rcs(lines)[:2], [-1, 0])
+    check("a step with a non-drawing message (a cache write) is refused and counted",
+          (rcs(lines)[2], d[1]["stSeq"], d[1]["stRefused"], d[1]["stCrc"], d[1]["cache"]), (-1, 1, 1, zero_crc, 0))
+    check("a keyframe step lands in the scratch shadow: the live shadow is untouched and nothing is presented",
+          (rcs(lines)[3], d[2]["stSeq"], d[2]["stRefused"], d[2]["stCrc"] != zero_crc, crc_line[1], crc_line[4], d[2]["presents"]),
+          (0, 2, 0, True, f"{zero_crc:08x}", "0", 0))
+    check("after end, a step is refused until the next begin", (rcs(lines)[4:], d[3]["stSeq"]), ([0, -1], 2))
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg 1000", "msg 1001" + kf,
+                 "settings " + control(OP_TELEMETRY, 12).hex(), "dmg", "tick 200000", "msg 1001" + kf, "dmg"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    check("TELEMETRY carries the step count, the refusal and the scratch CRC (fields 20-22)",
+          sends(lines)[-1], f"send 1 9 {telemetry(12, 1000, 0, 0, 90000, 1, st=(1, 0, d[0]['stCrc'])).hex()}")
+    check("the lease's lapse releases the scratch: the next step is refused and not counted", (rcs(lines)[-1], d[1]["stSeq"]), (-1, 1))
 
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0

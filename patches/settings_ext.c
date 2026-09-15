@@ -109,8 +109,7 @@ __attribute__((used, noinline)) int cfw_fb_lease_active(void) {
     if ((int32_t)(ctx->direct_lease_deadline - FW_MS_TICK) <= 0) {
         ctx->direct_lease_deadline = 0;
         ctx->direct_active = 0;
-        cfw_texture_cache_release(ctx);
-        damage_clear_flags(ctx);
+        damage_lease_ended(ctx);       /* the cache: released, or kept under CACHE_KEEP (damage_ext.c) */
         return 0;
     }
     return 1;
@@ -258,15 +257,13 @@ static void faceclaw_apply_control(const uint8_t *data, uint32_t len) {
         if (ctx->direct_lease_deadline == 0 ||
             (int32_t)(ctx->direct_lease_deadline - FW_MS_TICK) <= 0) {
             ctx->direct_active = 0;
-            cfw_texture_cache_release(ctx);
-            damage_clear_flags(ctx);
+            damage_lease_fresh_acquire(ctx);   /* the cache: released, or carried over under CACHE_KEEP */
         }
         ctx->direct_lease_deadline = FW_MS_TICK + FACECLAW_LEASE_MS;
     } else if (op == FACECLAW_OP_FB_RELEASE) {
         ctx->direct_lease_deadline = 0;
         ctx->direct_active = 0;
-        cfw_texture_cache_release(ctx);
-        damage_clear_flags(ctx);
+        damage_lease_ended(ctx);       /* the cache: released, or kept under CACHE_KEEP */
     } else if (op == FACECLAW_OP_WEAR_QUERY) {
         unsigned status = FW_WEAR_STATUS();
         if (status == 1u || status == 2u)

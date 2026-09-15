@@ -15,12 +15,21 @@ flashed or sent to a device. It is display-rendering test tooling.
 - `cfw_host_shim.c` maps the firmware's code and RAM address ranges at their exact values and
   writes a small x86 jump at each firmware function address the sources call, to a host function
   with the same prototype. inflate is the host's zlib; the display task's refresh runs
-  synchronously (copy hook, then the gate given back); timers, sound, radio and sensors do nothing.
+  synchronously (copy hook, the gate given back, then the refresh call through
+  `damage_refresh_hook`, whose modeled panel transfer advances the cycle counter by 1,234 µs);
+  timers, sound, radio and sensors do nothing. The stock senders' lens rule is modeled: a
+  message the code sends from the LEFT lens is refused (return 8) and printed by nothing, as
+  `FUN_00475b14` does on the glasses; the `dmg` command reads the Damage extension's state from
+  the context instead.
 - `run_vectors.py` builds the harness and runs the conformance vectors, one process per lens.
 - `test_damage_ext.py` checks `patches/damage_ext.c` (Damage `FIRMWARE.md` §0/§3: DamageCaps, the control
-  ops, the telemetry record, flags cleared with the lease) byte for byte against expectations written from
-  the contract text. The harness answers `settings HEX` and `respond HEX` for it and prints every message the
-  patch code sends.
+  ops, the telemetry record, flags cleared with the lease, the F1.3 transfer stamp and presented notify,
+  F1.5 cache-keep with its generation and CRC, the mode-16 self-test) byte for byte against expectations
+  written from the contract text. The harness answers `settings HEX`, `respond HEX` and `dmg` for it and
+  prints every message the patch code sends from the right lens.
+- `run_self_test.py` runs the drawing vectors through the self-test path (mode 16) and checks that every
+  step's scratch CRC and return code equal the normal path's expectations, on both lenses, with the live
+  shadow untouched and nothing presented.
 
 ## The vectors
 
@@ -32,6 +41,7 @@ files through its Kotlin simulator. For v1 (the installed firmware) the C is the
 ```
 python3 host/run_vectors.py --write     # after Damage's make_vectors.py changes the inputs
 python3 host/run_vectors.py             # check
+python3 host/run_self_test.py           # the same vectors through the self-test path
 python3 host/test_damage_ext.py         # the settings extension against the contract
 ```
 
@@ -45,3 +55,6 @@ Needs clang, a 32-bit libc and a 32-bit zlib (Gentoo multilib: present on beardo
   radios and is not modeled here.
 - Mode 15 (the firmware's own font) and the BMP path draw nothing here; Damage never sends them.
 - The diagnostic overlay stays hidden: its text carries timings and heap figures that vary.
+- Timing: the DWT cycle counter advances only in the modeled panel transfer, so the copy and
+  worker stamps read 0 unless a present happened inside their region — on the host the worker's
+  does (the refresh runs synchronously inside the dispatch), on the glasses it does not.

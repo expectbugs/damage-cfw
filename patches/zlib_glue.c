@@ -84,6 +84,8 @@
  *                              stock background 20 px font chain and its default
  *                              pair kerning. Bytes 1..31 adjust x by -10..20 as in
  *                              mode 14; options and clipping also match mode 14.
+ *   16          -> [16][sub][...] the Damage self-test (damage_ext.c): drawing messages
+ *                              against a scratch shadow, nothing presented.
  *   anything else / too short  -> load_bmp_fast (rejects cleanly if not a BMP).
  *
  * The HIGH BIT of the mode byte is a "lenses differ" flag; most modes ignore it. For
@@ -488,6 +490,13 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
         return cfw_texture_cache_update(src + 1, srclen - 1);
     }
 
+    if (mode == 16) {
+        /* The Damage self-test (damage_ext.c): drawing messages against a scratch
+         * shadow with presents suppressed. Not a shadow message: the live shadow
+         * and the display gate are untouched. */
+        return damage_self_test(src, srclen);
+    }
+
     /* Custom shadow geometry is deliberately independent from the EvenHub carrier. */
     uint32_t w = IMAGE_W;
     uint32_t h = IMAGE_H;
@@ -665,6 +674,7 @@ static void present_shadow(uint8_t *state, uint32_t w, uint32_t h, cfw_rectlist 
     customCfwContext *ctx = getCustomCfwContext();
     uint8_t *shadow = cfw_shadow_buffer(state);
     if (ctx == 0 || shadow == 0 || w != IMAGE_W || h != IMAGE_H) return;
+    if (ctx->dmg_st_active) return;                   /* a self-test step: nothing is published */
 
     ctx->direct_shadow = shadow;
     ctx->direct_pending = 1;                          /* publish last */
@@ -827,7 +837,7 @@ static int cfw_cleanup_session(void) {
     ctx->direct_shadow = 0;
     ctx->direct_failed = 0;
     cfw_texture_cache_release(ctx);
-    damage_clear_flags(ctx);
+    damage_session_cleanup(ctx);
 
     /* Suppress callbacks before asking the timer service to stop/delete them;
      * a callback already dispatched on the timer thread will then be harmless. */
@@ -912,6 +922,8 @@ void display_copy_hook(void) {
         uint32_t desc[2] = {(uint32_t)(uintptr_t)fb, PANEL_BYTES};
         FW_FLUSH(desc);
         ctx->direct_active = 1;
+        ctx->dmg_present_seq++;                      /* F1.3: the refresh that follows is this frame's */
+        ctx->dmg_direct_presented = 1;
     } else {
         ctx->direct_active = 0;
         ctx->direct_failed = 1;

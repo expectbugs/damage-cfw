@@ -38,3 +38,16 @@ int host_flags(uint8_t *out) {
     out[3] = ctx->f_snap_of; out[4] = (uint8_t)(cfw_alloc_diag() & 1u);
     return 1;
 }
+
+/* The Damage extension's state (damage_ext.c), for tests of what the left lens holds
+ * but cannot report: flags, the status register, the cache generation and the
+ * cache-keep latch, the direct presents and the last transfer stamp, the self-test's
+ * step count, last refusal and scratch CRC, and whether a texture cache is allocated. */
+void host_damage_state(uint32_t *out) {
+    customCfwContext *ctx = peekCustomCfwContext();
+    if (!ctx) return;
+    out[0] = ctx->dmg_flags; out[1] = ctx->dmg_status; out[2] = ctx->dmg_cache_gen;
+    out[3] = ctx->dmg_cache_keep_latched; out[4] = ctx->dmg_present_seq; out[5] = ctx->dmg_last_transfer_us;
+    out[6] = ctx->dmg_st_seq; out[7] = ctx->dmg_st_refused; out[8] = ctx->dmg_st_crc;
+    out[9] = ctx->texture_cache != 0;
+}

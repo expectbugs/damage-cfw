@@ -22,6 +22,20 @@
 #define CFW_SNAP_BUSY_SEQ 0xffffffffU /* range is reserved by the deferred worker */
 #define CFW_SEQ_MAX   48     /* max steps in a buzzer tone sequence (mode-5 kind 4) */
 
+/* The mode-3 frame-order diagnostics as one block, so the Damage self-test
+ * (damage_ext.c) can swap its own in for a step and restore the live one after. */
+typedef struct {
+    uint16_t last_fid;
+    uint16_t high_fid;
+    uint8_t  diag_seen;
+    uint8_t  fid_resync;
+    uint8_t  f_reorder;
+    uint8_t  f_skip;
+    uint8_t  f_dup;
+    uint8_t  recent_pos;
+    uint16_t recent_fids[CFW_FID_RING];
+} damage_diag_state;
+
 /* One snapshotted compressed image message. Taken at reconstruction-complete (both
  * lenses), consumed FIFO in the deferred handler. Keyed by the owning image-state
  * pointer so multiple containers (e.g. faceclaw's 4 tiles) don't cross-feed. */
@@ -115,18 +129,42 @@ typedef struct {
     /* --- Damage settings extension (damage_ext.c; Damage FIRMWARE.md §0/§3, draft).
      * Appended at the tail so every existing field offset is unchanged. --- */
     uint32_t dmg_flags;                     /* flags armed by the phone; cleared with the lease */
-    uint8_t  dmg_status;                    /* last status of a Damage op (0 ok) */
-    uint8_t  dmg_reply_buf[128];            /* stable storage for the field-111 telemetry reply */
+    uint8_t  dmg_status;                    /* the status register (FIRMWARE.md §1.2): the last recording op's */
+    uint8_t  dmg_reply_buf[192];            /* stable storage for the field-111 telemetry reply */
+    /* F1.3: the panel-transfer stamp. display_copy_hook marks a direct copy; the
+     * refresh wrapper consumes the mark and times the stock refresh call. */
+    uint8_t  dmg_direct_presented;          /* a direct frame was copied; the next refresh is its transfer */
+    uint32_t dmg_present_seq;               /* direct frames copied into the framebuffer */
+    uint32_t dmg_last_transfer_us;          /* the panel transfer that followed the last direct copy */
+    uint8_t  dmg_notify_buf[64];            /* stable storage for the field-113 presented notify */
+    /* F1.5: cache-keep. The CACHE_KEEP flag, read when the flags clear at a lease
+     * lapse or release, is latched here for the fresh acquire that follows. */
+    uint8_t  dmg_cache_keep_latched;
+    uint8_t  dmg_lease_settled;             /* the current lapse or release has been settled once */
+    uint32_t dmg_cache_gen;                 /* mode-12 writes that changed the cache since boot */
+    /* The self-test (mode 16): a scratch shadow the drawing ops run against with
+     * presents suppressed, its own frame-order diagnostics, and the last step's result. */
+    uint8_t *dmg_st_shadow;                 /* PANEL_BYTES from heap 13, or 0 */
+    uint8_t  dmg_st_active;                 /* a step is running: present_shadow returns without publishing */
+    uint8_t  dmg_st_free_pending;           /* a release arrived from another task during a step: the step's epilogue frees */
+    uint8_t  dmg_st_refused;                /* the last step's message was refused */
+    uint32_t dmg_st_seq;                    /* steps run since the begin */
+    uint32_t dmg_st_crc;                    /* CRC-32 of the scratch shadow after the last step */
+    damage_diag_state dmg_st_diag;          /* the self-test's fid ring and flags (swapped in per step) */
 } customCfwContext;
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */
 #define CFW_ALLOC_DIAG_SLOT 0x202a6274U /* second word: magic | sticky failure bit */
 #define CFW_ALLOC_DIAG_MAGIC 0xA110CA7EU
-#define CFW_CTX_MAGIC 0xC0FFEE69U    /* bumped for the context layout change (Damage fields) */
+#define CFW_CTX_MAGIC 0xC0FFEE6AU    /* bumped for the context layout change (Damage Phase 1 fields) */
 
 #define FW_MS_TICK  (*(volatile uint32_t *)0x20074a34U)  /* firmware 1 ms OS tick (SysTick chain) */
 
 static customCfwContext *peekCustomCfwContext(void);
 static customCfwContext *getCustomCfwContext(void);
 int cfw_fb_lease_active(void);
-void damage_clear_flags(customCfwContext *ctx);   /* damage_ext.c: at every lease release point */
+void damage_clear_flags(customCfwContext *ctx);          /* damage_ext.c */
+void damage_lease_ended(customCfwContext *ctx);          /* damage_ext.c: a lapse noticed, or FB_RELEASE */
+void damage_lease_fresh_acquire(customCfwContext *ctx);  /* damage_ext.c: FB_ACQUIRE with no live lease */
+void damage_session_cleanup(customCfwContext *ctx);      /* damage_ext.c: mode 11 */
+int  damage_self_test(const uint8_t *src, uint32_t srclen);   /* damage_ext.c: image mode 16 */

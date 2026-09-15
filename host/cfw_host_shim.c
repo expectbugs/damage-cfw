@@ -30,7 +30,17 @@
  *   flags            answers "flags reorder skip dup snapof alloc"
  *   settings HEX     a whole sid-0x09 request payload through settings_decode_wrapper
  *   respond HEX      a stock settings response body through settings_send_wrapper
- * Every message the patch code sends answers "send TYPE SID HEX".
+ *   dmg              answers "dmg FLAGS STATUS GEN LATCHED PRESENTS TRANSFER_US ST_SEQ ST_REFUSED
+ *                    ST_CRC CACHE" — the Damage extension's state (damage_ext.c), read straight
+ *                    from the context: what the left lens holds but cannot report
+ * Every message the patch code sends answers "send TYPE SID HEX" — from the RIGHT lens
+ * only: the stock senders refuse on the left lens (FUN_00475b14 -> FUN_0046f258 -> 8), and
+ * so does h_send, so a test sees what the phone would.
+ *
+ * The display task's refresh (FUN_004ca564, the sixth firmware call a type-3 refresh
+ * makes) is modeled by h_panel_refresh: it counts, and advances the DWT cycle counter by
+ * 1,234 µs worth of the primed 250,000 cycles/ms, so the F1.3 transfer stamp is a
+ * known number here (0 for the copy and the worker, whose regions see no cycles).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,6 +60,8 @@ int image_deferred(uint8_t *state, uint8_t *src, uint32_t len);
 void display_copy_hook(void);
 int settings_decode_wrapper(void *stream, const void *fields, void *dest);
 int settings_send_wrapper(int type, int sid, unsigned char *buf, unsigned len);
+int damage_refresh_hook(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f);
+void host_damage_state(uint32_t *out);
 
 /* ---- fixed regions (addresses from the patch sources) ---- */
 #define CODE_BASE   0x00438000u   /* stock main app load address */
@@ -72,7 +84,7 @@ int settings_send_wrapper(int type, int sid, unsigned char *buf, unsigned len);
 #define ZLIB_VER_ADDR     0x0078d654u
 
 static uint32_t lens_side = 1;          /* FW_SIDE(): 1 right, 2 left */
-static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies;
+static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes;
 static uint32_t pool_next = POOL_BASE;
 static uint32_t timer_handles;
 static uint8_t state[0x48];
@@ -116,12 +128,19 @@ static uint8_t *h_lookup(uint32_t id) { (void)id; return 0; }
 static int h_complete_emit(uint32_t id, void *hdr, int k, uint32_t p) { (void)id; (void)hdr; (void)k; (void)p; return 0; }
 static void h_display_wait(void) { gate_takes++; }
 static void h_display_signal(void) { gate_gives++; }
+static int h_panel_refresh(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+    panel_refreshes++;
+    *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * 1234u;   /* DWT CYCCNT: 1,234 µs at 250 cycles/µs */
+    return 0;
+}
 static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t w, uint32_t hh) {
-    (void)a; (void)b; (void)c; (void)d; (void)w; (void)hh;
-    /* the display task: FUN_00473c44 type 3 runs the copy hook, then gives the gate */
+    /* the display task: FUN_00473c44 type 3 runs the copy hook, gives the gate, then
+     * (panel on) calls the refresh — through damage_refresh_hook since the F1.3 site */
     presents++;
     display_copy_hook();
     gate_gives++;
+    damage_refresh_hook(a, b, c, d, w, hh);
     return 0;
 }
 static void h_display_copy(void) { stock_copies++; }
@@ -138,6 +157,7 @@ static void h_free(void *p) { (void)p; }
 static void *h_heap_malloc(uint32_t desc, uint32_t n) { (void)desc; return malloc(n); }
 static void h_heap_free(uint32_t desc, void *p) { (void)desc; free(p); }
 static int h_send(int t, int sid, unsigned char *b, unsigned l) {
+    if (lens_side == 2) return 8;     /* FUN_00475b14 / FUN_00475c1a: the left lens does not send */
     printf("send %d %d ", t, sid);
     for (unsigned i = 0; i < l; i++) printf("%02x", b[i]);
     printf("\n");
@@ -167,7 +187,7 @@ static const struct jump jumps[] = {
     {0x00449499u, h_timer_start}, {0x004493b1u, h_timer_new}, {0x004494d9u, h_timer_stop}, {0x0044953fu, h_timer_stop},
     {0x00464b2fu, h_app_start}, {0x004e0cbbu, h_void}, {0x004e0ccfu, h_lookup}, {0x004da383u, h_complete_emit},
     {0x0047381fu, h_display_wait}, {0x0047386bu, h_display_signal}, {0x00474067u, h_display_queue},
-    {0x0046ca15u, h_display_copy},
+    {0x0046ca15u, h_display_copy}, {0x004ca565u, h_panel_refresh},
     {0x005455e5u, h_int_void}, {0x0054566du, h_int_void}, {0x0045f8fdu, h_event_forward}, {0x0058705du, h_compass_notify},
     {0x00474cd3u, h_malloc}, {0x00474d17u, h_free}, {0x00484181u, h_heap_malloc}, {0x0048429fu, h_heap_free},
     {0x00475b15u, h_send}, {0x00475c1bu, h_send}, {0x00490121u, h_pb_decode}, {0x0049eb8fu, h_wear},
@@ -257,6 +277,10 @@ int main(void) {
             uint8_t fl[5] = {0};
             host_flags(fl);
             printf("flags %u %u %u %u %u\n", fl[0], fl[1], fl[2], fl[3], fl[4]);
+        } else if (!strncmp(line, "dmg", 3)) {
+            uint32_t d[10] = {0};
+            host_damage_state(d);
+            printf("dmg %u %u %u %u %u %u %u %u %08x %u\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
         } else if (line[0] != '\n' && line[0] != '#') {
             printf("error unknown command\n");
         }
