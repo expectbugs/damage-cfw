@@ -288,18 +288,18 @@ void damage_slots_free(damage_slot *slots, uint32_t *bytes) {
  * lands during the mark is deferred to the epilogue below, as a self-test step defers the
  * scratch's. The fields are volatile so the mark-then-access and the check-then-free keep
  * their program order. */
-static void damage_slots_enter(customCfwContext *ctx) { ctx->dmg_slots_active = 1; }
+static void damage_slots_enter(customCfwContext *ctx) {
+    __atomic_store_n(&ctx->dmg_slots_active, (uint8_t)DMG_BUSY_ACTIVE, __ATOMIC_SEQ_CST);
+}
 
 static void damage_slots_leave(customCfwContext *ctx) {
-    /* The deferred free runs while the mark is still UP, so a release point that lands during it
-     * is deferred again instead of freeing the same buffers a second time (2026-09-15, the third
-     * review: clearing the mark first left the free itself outside the mechanism that protects
-     * it, and both tasks could hand the same heap-13 block back). */
-    while (ctx->dmg_slots_free_pending) {
-        ctx->dmg_slots_free_pending = 0;
-        damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
-    }
-    ctx->dmg_slots_active = 0;
+    /* One exchange takes the mark down and reads what it held (cfw_context.h, DMG_BUSY_*): a
+     * release point that arrived during the op left PENDING and is honoured here; one that
+     * arrives after this instant finds the mark down and frees on its own task. The free claims
+     * each slot's pointer with its own exchange, so neither can hand a block back twice
+     * (2026-09-15, the third review, and 2026-09-16 for the window between the two flags). */
+    uint8_t seen = __atomic_exchange_n(&ctx->dmg_slots_active, (uint8_t)DMG_BUSY_IDLE, __ATOMIC_SEQ_CST);
+    if (seen == DMG_BUSY_PENDING) damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
 }
 
 
@@ -380,7 +380,10 @@ static int damage_op_string(customCfwContext *ctx, uint8_t *shadow, uint32_t str
     damage_clip c = damage_clip_of(rl, panel_w, panel_h);
     for (uint32_t i = 0; i < string_len; i++) {
         uint32_t ch = string[i];
-        if (ch <= 31u) { x += (int32_t)ch - 11; continue; }
+        /* the first pass's classification, re-made on the byte this pass reads: a 0 byte is
+         * refused there and must not draw as an adjust here (2026-09-16 review) */
+        if (ch >= 1u && ch <= 31u) { x += (int32_t)ch - 11; continue; }
+        if (ch < 32u) { damage_refuse(src, DMG_REF_CODE); return -1; }
         cfw_cached_image g;
         /* the table pointer is re-derived from the published one, not carried from before the
          * first pass: a release point on another task can free the cache between the two passes,
@@ -446,7 +449,12 @@ static int damage_op_cache_write(customCfwContext *ctx, const uint8_t *src, uint
          * kept the write inside the cache but read past the end of the message. */
         if (len > srclen - pos) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         if (off > size || len > size - off) { damage_refuse(src, DMG_REF_RECORD); return -1; }
-        for (uint32_t i = 0; i < len; i++) ctx->texture_cache[off + i] = src[pos + i];
+        /* and the pointer, tested rather than dereferenced through: a release point on another
+         * task frees the cache and stores 0 mid-chunk, and the stores would follow it to low
+         * memory (2026-09-16 review; the draw paths got this in the third) */
+        uint8_t *cache = ctx->texture_cache;
+        if (cache == 0) { damage_refuse(src, DMG_REF_RECORD); return -1; }
+        for (uint32_t i = 0; i < len; i++) cache[off + i] = src[pos + i];
         pos += len;
     }
     ctx->dmg_cache_gen++;

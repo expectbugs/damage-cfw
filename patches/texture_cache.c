@@ -268,8 +268,13 @@ static int cfw_texture_cache_update(const uint8_t *src, uint32_t len) {
         pos += 4u;
         if (entry_len > len - pos) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
         if (offset + entry_len > CFW_TEXTURE_CACHE_SIZE) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
-        for (uint32_t i = 0; i < entry_len; i++)
-            ctx->texture_cache[offset + i] = src[pos + i];
+        /* the pointer is re-read here too, and TESTED: a release point on the settings task or the
+         * input thread frees the cache and stores 0 while this loop runs, and the compiler reloads
+         * the pointer for every store — the next one would then be a write at the offset itself,
+         * low in the address space (2026-09-16 review; the read paths got this in the third) */
+        uint8_t *cache = ctx->texture_cache;
+        if (cache == 0) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
+        for (uint32_t i = 0; i < entry_len; i++) cache[offset + i] = src[pos + i];
         pos += entry_len;
     }
     ctx->dmg_cache_gen++;                      /* Damage F1.5: the cache's generation */
@@ -344,10 +349,15 @@ static int cfw_texture_draw_string(uint8_t *shadow, uint32_t stride,
 
     for (uint32_t i = 0; i < string_len; i++) {
         uint32_t ch = string[i];
-        if (ch <= 31u) {
+        /* the same classification the pass above made, on the byte THIS pass reads: a byte that
+         * changed under the loop (the message sits in the receiver's buffer) would otherwise be
+         * indexed straight into a 192-byte table — code 0xFF reads 254 bytes past a 64 KiB cache —
+         * and a 0 byte would draw as an adjust where the first pass refuses it (2026-09-16 review) */
+        if (ch >= 1u && ch <= 31u) {
             x += (int32_t)ch - 11;
             continue;
         }
+        if (ch < 32u || ch > 127u) { damage_refuse(msg, DMG_REF_CODE); return -1; }
         /* `table` is re-derived from the published pointer, and the refusal is recorded: a
          * release point on another task (the settings task, the input thread) can free the cache
          * between the two passes, so this pass can fail — silently, until now (2026-09-15, the

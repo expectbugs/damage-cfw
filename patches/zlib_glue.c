@@ -295,6 +295,14 @@ static int cfw_cleanup_session(void);
 static void mic_cleanup_session(void);   /* mic_control.c (same TU): mic hw + lease teardown */
 
 static int inflate_rle(uint8_t *strm, uint8_t *base, uint32_t stride, uint32_t rowbytes, uint32_t rows);
+
+/* What a mode-8 batch's sub-message, and what a self-test step, may carry (Damage FIRMWARE.md
+ * §4 and §3). Checked where the message is accepted AND again on the byte that dispatches. */
+static int damage_submode_ok(unsigned mode) {
+    return mode == 3u || mode == 6u || mode == 9u ||
+           mode == 13u || mode == 14u || mode == 15u ||
+           (mode >= 17u && mode <= 24u && mode != 19u);
+}
 static void present_shadow(uint8_t *state, uint32_t w, uint32_t h, cfw_rectlist *rl);
 static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, int present, cfw_rectlist *rl);
 
@@ -383,6 +391,25 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
 
     int lenses_differ = src[0] & 0x80;             /* high bit: per-lens variant */
     uint8_t mode = src[0] & 0x7f;
+
+    /* The mode byte the caller's allow-list approved is not necessarily this one: the message
+     * sits in the receiver's buffer and a later message can reach it, which is why modes 12 and
+     * 19 re-read their entry headers inside their write loops (2026-09-15, the second and third
+     * reviews). A batch's sub-message and a self-test step are approved the same way, so both
+     * lists are applied again HERE, to the byte that dispatches (2026-09-16 review). In the
+     * quiet case the byte is the same and the caller has already refused, so no record moves. */
+    if (!present && !damage_submode_ok(mode)) { damage_refuse(src, DMG_REF_MODE); return -1; }
+    {
+        customCfwContext *sctx = peekCustomCfwContext();
+        if (sctx && sctx->dmg_st_active &&
+            !(damage_submode_ok(mode) || (present && mode == 8u))) {
+            /* a step may carry only what FIRMWARE.md §3 lists; mode 16 nested inside itself
+             * would clear the running step's mark, mode 11 would free the session's cache and
+             * slots, and a cache write would reach the LIVE cache from a step */
+            damage_refuse(src, DMG_REF_MODE);
+            return -1;
+        }
+    }
     if (mode == 0x42) return load_bmp_fast(state, src, srclen);       /* raw BMP */
 
     if (mode == 5) {
@@ -568,12 +595,10 @@ static int image_dispatch(uint8_t *state, const uint8_t *src, uint32_t srclen, i
             uint32_t seglen = rd16(src + pos);
             pos += 2;
             if (seglen < 1 || pos + seglen > srclen) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
-            uint8_t submode = src[pos] & 0x7fu;
-            if (submode != 3 && submode != 6 && submode != 9 &&
-                submode != 13 && submode != 14 && submode != 15 &&
-                !(submode >= 17 && submode <= 24 && submode != 19)) {   /* Damage v2: all but the cache write */
-                damage_refuse(src, DMG_REF_MODE); return -1;
-            }
+            /* Damage v2: all but the cache write. The structural refusal is the BATCH's
+             * (§4), so it records the batch's own mode byte; image_dispatch applies the same
+             * list to the byte it reads, for the case where the two differ. */
+            if (!damage_submode_ok(src[pos] & 0x7fu)) { damage_refuse(src, DMG_REF_MODE); return -1; }
             if (image_dispatch(state, src + pos, seglen, 0, rl) != 0) return -1;   /* the sub-message recorded its reason */
             pos += seglen;
         }
@@ -1013,6 +1038,12 @@ void display_copy_hook(void) {
         ctx->direct_failed = 1;
         ctx->dmg_hint_r_on = 0;
         ctx->dmg_panel_stale = 1;                    /* stock content is going to the panel instead */
+        /* and the F1.3 mark, as the stock path above does: the framebuffer holds stock content,
+         * so the refresh that follows is not a Damage frame's transfer. Left standing, a mark
+         * from an earlier direct copy whose refresh was skipped (the panel off) made
+         * damage_refresh_hook stamp this stock refresh and send a presented notify for a frame
+         * that never went — the record Phase 2's test stop prices with (2026-09-16 review). */
+        ctx->dmg_direct_presented = 0;
         FW_DISPLAY_COPY();
     }
     ctx->last_present_us = cfw_time_end(&t);

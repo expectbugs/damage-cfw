@@ -18,8 +18,8 @@ FIRMWARE.md §4, fields 23-25: mode byte, reason, copy sequence; zeros when none
 the status register (field 4); --write stores them as the step's expectation:
     "expect": {"L": "<crc>", "R": "<crc>", "rc": {"L": [..], "R": [..]}, "ref": {"L": [m, r, s, st], "R": [m, r, s, st]}}
 Ops in a step: {"tick": ms}, {"lease": "acquire"|"release"}, {"msg": HEX}, and — Phase 2 —
-{"flags": N} (a FLAGS_SET of the whole set N) and {"cachesize": KiB} (op 5), both sid-0x09
-field-112 requests to the lens.
+{"flags": N} (a FLAGS_SET of the whole set N), {"cachesize": KiB} (op 5), both sid-0x09
+field-112 requests to the lens, and {"stock": true} (the stock compositor's own repaint).
 Exit status is non-zero on any mismatch, a harness error, or a gate imbalance
 (the display gate must be given back as often as it is taken).
 """
@@ -71,6 +71,10 @@ def run_lens(vec, lens):
                 lines.append("settings " + damage_control(2, int(op["flags"])))
             elif "cachesize" in op:
                 lines.append("settings " + damage_control(5, int(op["cachesize"])))
+            elif "stock" in op:
+                # the stock compositor's own repaint (Damage FIRMWARE.md §9): its copy puts stock
+                # content in the framebuffer and the refresh that follows sends it to the panel
+                lines.append("refresh")
             else:
                 sys.exit(f"{vec['name']}: unknown op {op}")
         lines.append("crc")

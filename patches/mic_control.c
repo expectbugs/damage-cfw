@@ -70,7 +70,7 @@
  *   [0]  'S'   [1] 'M'   [2] ver=1
  *   [3]  flags       config MIC_FLAG_* bits, plus bit7 = payload truncated
  *   [4]  seqLo  [5] seqHi        (low 16 bits of the frame counter)
- *   [6..9]  tick     u32 LE, this temple's 1 ms OS tick at packetization
+ *   [6..9]  tick     u32 LE, this temple's OS tick at packetization (1.024 per ms)
  *   [10] nCh         channels in the payload (1 or 2)
  *   [11..12] rateDiv u16 LE, EFFECTIVE sample rate in units of 100 Hz
  *   [13] fmt         PCM width code as configured (0=16/1=24/2=32-bit)

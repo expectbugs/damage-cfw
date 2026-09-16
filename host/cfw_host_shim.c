@@ -364,6 +364,10 @@ int main(void) {
             printf("crc %08lx %08lx presents %u gate %u/%u bmp %u panel %08lx\n", s, f, presents, gate_takes, gate_gives, bmp_calls, pn);
         } else if (!strncmp(line, "panel ", 6)) {
             panel_on = line[6] != '0';
+        } else if (!strncmp(line, "fb ", 3)) {
+            /* the framebuffer the copy hook writes into: 0 makes the copy FAIL, which is the
+             * branch that hands the panel back to stock (2026-09-16 review) */
+            *(uint32_t *)(uintptr_t)FW_DISPLAY_FB_PTR = line[3] != '0' ? HOST_FB : 0u;
         } else if (!strncmp(line, "refresh", 7)) {
             h_stock_refresh();
         } else if (!strncmp(line, "split ", 6)) {
@@ -394,11 +398,11 @@ int main(void) {
             host_flags(fl);
             printf("flags %u %u %u %u %u\n", fl[0], fl[1], fl[2], fl[3], fl[4]);
         } else if (!strncmp(line, "dmg", 3)) {
-            uint32_t d[19] = {0};
+            uint32_t d[20] = {0};
             host_damage_state(d);
             d[17] = partial_refreshes;
-            printf("dmg %u %u %u %u %u %u %u %u %08x %u %u %u %u %u %u %u %u %u %u\n", d[0], d[1], d[2], d[3], d[4], d[5],
-                   d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18]);
+            printf("dmg %u %u %u %u %u %u %u %u %08x %u %u %u %u %u %u %u %u %u %u %u\n", d[0], d[1], d[2], d[3], d[4], d[5],
+                   d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19]);
         } else if (!strncmp(line, "ops ", 4)) {
             *(uint32_t *)(uintptr_t)PANEL_OPS_WORD = !strncmp(line + 4, "jbd", 3) ? OPS_JBD4010
                                                    : !strncmp(line + 4, "a6ng", 4) ? OPS_A6NG : 0u;

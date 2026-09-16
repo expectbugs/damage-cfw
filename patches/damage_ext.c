@@ -217,22 +217,34 @@ static void damage_self_test_free(customCfwContext *ctx) {
     damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* the self-test's save-under slots */
 }
 
+/* A release point (settings task, input thread) asks for the scratch. The claim is one
+ * compare-exchange: it either marks the running step PENDING — whose epilogue then frees —
+ * or finds the step already gone and frees here. A flag pair could not do this: the step's
+ * epilogue cleared its mark between a release's test of that mark and its store of the
+ * pending flag, and the free was then owed to nobody (2026-09-16 review). */
 static void damage_self_test_release(customCfwContext *ctx) {
     if (ctx == 0) return;
-    if (ctx->dmg_st_active) { ctx->dmg_st_free_pending = 1; return; }
-    damage_self_test_free(ctx);
+    uint8_t seen = DMG_BUSY_ACTIVE;
+    if (__atomic_compare_exchange_n(&ctx->dmg_st_active, &seen, (uint8_t)DMG_BUSY_PENDING, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;                                  /* deferred to the step's epilogue */
+    if (seen != DMG_BUSY_PENDING) damage_self_test_free(ctx);   /* no step running: free here */
 }
 
 /* The live save-under slots and the size asked for, at every release point. A step never
  * touches the live slots (mode 23 takes the self-test's set while one runs), but a live mode 23
  * on the image worker does, and this runs on the settings task or the input thread: a free that
  * lands while the worker holds the slots is deferred to the worker's epilogue, as a step's is
- * for the scratch (2026-09-15, second review). The size asked for goes whether the cache went
- * or was kept by CACHE_KEEP. The panel is stock's again after a release, so the next Damage
- * frame goes whole rather than through a partial refresh (mode 24). */
+ * for the scratch (2026-09-15, second review) — through the same one-word claim, for the same
+ * reason (2026-09-16 review). The size asked for goes whether the cache went or was kept by
+ * CACHE_KEEP. The panel is stock's again after a release, so the next Damage frame goes whole
+ * rather than through a partial refresh (mode 24). */
 static void damage_live_slots_release(customCfwContext *ctx) {
-    if (ctx->dmg_slots_active) ctx->dmg_slots_free_pending = 1;
-    else damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
+    uint8_t seen = DMG_BUSY_ACTIVE;
+    if (!__atomic_compare_exchange_n(&ctx->dmg_slots_active, &seen, (uint8_t)DMG_BUSY_PENDING, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) &&
+        seen != DMG_BUSY_PENDING)
+        damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
     ctx->dmg_cache_req = 0;
     ctx->dmg_panel_stale = 1;
 }
@@ -241,16 +253,14 @@ static void damage_live_slots_release(customCfwContext *ctx) {
  * from another task meanwhile (deferred above) is honoured now — the scratch and the
  * self-test's slots. Returns 1 if one had. */
 static int damage_self_test_settle(customCfwContext *ctx) {
-    /* the deferred free runs while the mark is still UP, so a release that lands during it is
-     * deferred again rather than freeing the same buffer twice (2026-09-15, the third review) */
-    int had = 0;
-    while (ctx->dmg_st_free_pending) {
-        ctx->dmg_st_free_pending = 0;
-        damage_self_test_free(ctx);             /* still under the mark: a release meanwhile defers again */
-        had = 1;
-    }
-    ctx->dmg_st_active = 0;
-    return had;
+    /* One exchange takes the mark down and reads what it held: a release that arrived during the
+     * step left PENDING and is honoured here, and one that arrives after this instant finds the
+     * mark down and frees on its own task. Nothing is owed to nobody, and nothing is freed twice
+     * (the free claims its pointer with its own exchange). */
+    uint8_t seen = __atomic_exchange_n(&ctx->dmg_st_active, (uint8_t)DMG_BUSY_IDLE, __ATOMIC_SEQ_CST);
+    if (seen != DMG_BUSY_PENDING) return 0;
+    damage_self_test_free(ctx);
+    return 1;
 }
 
 /* A lapse noticed by cfw_fb_lease_active, or an FB_RELEASE: settle what the flags
@@ -264,7 +274,11 @@ void damage_lease_ended(customCfwContext *ctx) {
     if (ctx->dmg_lease_settled) {
         /* Settled already (a lapse noticed before this release): the latch stands, but
          * the flags still clear — a FLAGS_SET taken since that lapse would otherwise
-         * survive the FB_RELEASE (2026-09-14, second review). */
+         * survive the FB_RELEASE (2026-09-14, second review). The slots, the size asked for
+         * and the panel mark go here too: this is a release point like any other, and leaving
+         * it out made the partial-refresh rule depend on three coincidences holding rather
+         * than on the rule itself (2026-09-16 review). */
+        damage_live_slots_release(ctx);
         ctx->dmg_flags = 0;
         return;
     }
@@ -333,11 +347,21 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
     unsigned n = 0;
     int leased = cfw_fb_lease_active();          /* notices a lapse first: flags then read 0 */
     uint32_t tick = FW_MS_TICK;
-    /* The display task writes both of these at the end of a refresh: take them together, so a
-     * refresh between the two fields cannot pair one frame's microseconds with the next
-     * frame's path (2026-09-15, second review). */
+    /* The display task writes both of these at the end of a refresh: take them from an even
+     * write count that did not move, so a refresh between the two fields cannot pair one
+     * frame's microseconds with the next frame's path (2026-09-15 second review; the write
+     * count 2026-09-16). A record still moving after the tries is reported as it last settled. */
     uint32_t transfer_us = ctx->dmg_last_transfer_us;
     uint32_t last_path = ctx->dmg_last_path;
+    for (unsigned tries = 0; tries < 4u; tries++) {
+        uint32_t gen = ctx->dmg_frame_gen;
+        if (gen & 1u) continue;
+        uint32_t tu = ctx->dmg_last_transfer_us;
+        uint32_t lp = ctx->dmg_last_path;
+        if (gen != ctx->dmg_frame_gen) continue;
+        transfer_us = tu; last_path = lp;
+        break;
+    }
     n += damage_put_varint_field(body + n, 1, request_id);
     n += damage_put_varint_field(body + n, 2, tick);
     n += damage_put_varint_field(body + n, 3, ctx->dmg_flags);
@@ -367,16 +391,32 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
     n += damage_put_varint_field(body + n, 15, transfer_us);
     n += damage_put_varint_field(body + n, 16, ctx->dmg_present_seq);
     n += damage_put_varint_field(body + n, 17, ctx->dmg_cache_gen);
-    if (ctx->texture_cache) {
-        uint32_t size = damage_cache_size(ctx);
-        n += damage_put_varint_field(body + n, 18, size);
+    /* one read of the pointer, and the allocated size that goes with it: a release point on
+     * another task frees the cache and zeroes dmg_cache_bytes between a test and a use, and the
+     * CRC would then run over 160 KiB of low memory and answer the atlas read-back gate with a
+     * number that means nothing (2026-09-16 review) */
+    uint8_t *cache = ctx->texture_cache;
+    uint32_t cache_bytes = ctx->dmg_cache_bytes;
+    if (cache && cache_bytes) {
+        n += damage_put_varint_field(body + n, 18, cache_bytes);
         if (with_cache_crc)
-            n += damage_put_varint_field(body + n, 19, damage_crc32(ctx->texture_cache, size));
+            n += damage_put_varint_field(body + n, 19, damage_crc32(cache, cache_bytes));
     }
-    n += damage_put_varint_field(body + n, 20, ctx->dmg_st_seq);
-    if (ctx->dmg_st_seq) {
-        n += damage_put_varint_field(body + n, 21, ctx->dmg_st_refused);
-        n += damage_put_varint_field(body + n, 22, ctx->dmg_st_crc);
+    /* the self-test's count, result and CRC, read whole for the same reason as the refusal
+     * record below: the image worker's CRC pass is milliseconds long (2026-09-16 review) */
+    uint32_t st_seq = ctx->dmg_st_seq, st_refused = ctx->dmg_st_refused, st_crc = ctx->dmg_st_crc;
+    for (unsigned tries = 0; tries < 4u; tries++) {
+        uint32_t gen = ctx->dmg_st_gen;
+        if (gen & 1u) continue;
+        uint32_t q = ctx->dmg_st_seq, r = ctx->dmg_st_refused, c = ctx->dmg_st_crc;
+        if (gen != ctx->dmg_st_gen) continue;
+        st_seq = q; st_refused = r; st_crc = c;
+        break;
+    }
+    n += damage_put_varint_field(body + n, 20, st_seq);
+    if (st_seq) {
+        n += damage_put_varint_field(body + n, 21, st_refused);
+        n += damage_put_varint_field(body + n, 22, st_crc);
     }
     /* the last image-lane refusal (damage_draw.c), read whole: the image lane may be writing it,
      * so the fields are taken from an even write count that did not move meanwhile (a few tries;
@@ -479,8 +519,13 @@ int damage_refresh_hook(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t
     } else {
         r = FW_PANEL_REFRESH(a, b, c, d, e, f);
     }
+    /* the two fields the phone A/Bs a flush with go up together: odd while they move, so the
+     * settings task cannot take this frame's microseconds with the previous frame's path
+     * (2026-09-16 review — the second review gave the READER this guard, not the writer) */
+    ctx->dmg_frame_gen++;
     ctx->dmg_last_transfer_us = cfw_time_end(&t);
     ctx->dmg_last_path = partial ? 1u : 0u;
+    ctx->dmg_frame_gen++;
     if (ctx->dmg_flags & DMG_FLAG_PRESENTED) damage_send_presented(ctx);
     return r;
 }
@@ -523,7 +568,7 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
          * under it: a release from another task in that time is deferred to the settle
          * below instead of freeing the scratch while it is being zeroed (2026-09-14,
          * second review). A begin the lease ended during is refused, the scratch freed. */
-        ctx->dmg_st_active = 1;
+        __atomic_store_n(&ctx->dmg_st_active, (uint8_t)DMG_BUSY_ACTIVE, __ATOMIC_SEQ_CST);
         uint8_t *shadow = ctx->dmg_st_shadow;
         if (shadow == 0) {
             shadow = (uint8_t *)cfw_heap13_malloc(DMG_ST_SHADOW_BYTES);
@@ -531,9 +576,11 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
             ctx->dmg_st_shadow = shadow;
         }
         bzero(shadow, DMG_ST_SHADOW_BYTES);
+        ctx->dmg_st_gen++;
         ctx->dmg_st_seq = 0;
         ctx->dmg_st_refused = 0;
         ctx->dmg_st_crc = 0;
+        ctx->dmg_st_gen++;
         damage_diag_reset(&ctx->dmg_st_diag);
         damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* a begin starts with empty slots */
         if (damage_self_test_settle(ctx)) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }   /* a release ended it */
@@ -548,7 +595,7 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
     if (!cfw_fb_lease_active()) { damage_refuse(src, DMG_REF_NO_LEASE); return -1; }   /* a lapse is settled here: the scratch goes with it */
     /* From here to the CRC a release from another task is deferred (damage_self_test_release);
      * the scratch pointer is read once, under that guard. */
-    ctx->dmg_st_active = 1;
+    __atomic_store_n(&ctx->dmg_st_active, (uint8_t)DMG_BUSY_ACTIVE, __ATOMIC_SEQ_CST);
     uint8_t *scratch = ctx->dmg_st_shadow;
     if (scratch == 0) { damage_self_test_settle(ctx); damage_refuse(src, DMG_REF_SCRATCH); return -1; }   /* no begin, or the lease released it */
     const uint8_t *msg = src + 2;
@@ -577,9 +624,14 @@ int damage_self_test(const uint8_t *src, uint32_t srclen) {
         rc = image_dispatch(fake, msg, msglen, 1, &rl);   /* mode 23 takes the self-test's slots under the mark */
         damage_swap_diag(ctx, &ctx->dmg_st_diag);
     }
+    /* The CRC is a pass over 153,600 bytes — milliseconds on the worker. With the count already
+     * advanced, a telemetry read landing inside it answered step N's count with step N-1's CRC,
+     * and the on-glass runner matches a vector by exactly that pair (2026-09-16 review). */
+    ctx->dmg_st_gen++;
     ctx->dmg_st_seq++;
     ctx->dmg_st_refused = rc == 0 ? 0u : 1u;
     ctx->dmg_st_crc = damage_crc32(scratch, DMG_ST_SHADOW_BYTES);
+    ctx->dmg_st_gen++;
     damage_self_test_settle(ctx);                /* a release that landed during the step is honoured now */
     return rc;
 }

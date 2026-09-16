@@ -81,7 +81,8 @@ def dmg(lines):
     """The last `dmg` line as a dict (host_damage_state's order)."""
     l = [x for x in lines if x.startswith("dmg ")][-1].split()
     keys = ["flags", "status", "gen", "latched", "presents", "transferUs", "stSeq", "stRefused", "stCrc", "cache", "directActive",
-            "refSeen", "refMode", "refReason", "refSeq", "cacheBytes", "lastPath", "partials", "slotBytes"]
+            "refSeen", "refMode", "refReason", "refSeq", "cacheBytes", "lastPath", "partials", "slotBytes",
+            "directPresented"]
     return {k: (int(v, 16) if k == "stCrc" else int(v)) for k, v in zip(keys, l[1:])}
 def rcs(lines): return [int(l.split()[1]) for l in lines if l.startswith("rc ")]
 
@@ -477,6 +478,22 @@ def main():
     c = [panel_crc(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("crc ")]
     check("a hint that misses a row the batch changed leaves it off the panel; the next full refresh brings the panel back to the framebuffer",
           (dmg(lines)["lastPath"], c[1]["panel"] == c[1]["fb"], c[2]["panel"] == c[2]["fb"]), (1, False, True))
+
+    # ---- 2026-09-16 review -------------------------------------------------------------
+    # A copy that FAILS (no framebuffer) hands the panel to stock, so the F1.3 mark must go with
+    # it. Left standing, the refresh that follows STAMPED that stock transfer as a Damage frame's
+    # and sent a presented notify for a frame that never went — the record Phase 2's test stop
+    # prices with. The mark itself reads 0 either way by the time the message returns (the
+    # refresh hook consumes it), so the notify count is what this asks about.
+    notifies = lambda lines: len([l for l in sends(lines) if "8a07" in l.split()[3]])
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_PRESENTED | FLAG_DRAW2).hex(),
+                 "msg " + kf,                                                  # presented: one notify
+                 "panel 0", "msg " + batch(fill_at(100)),                      # copied, refresh skipped: none
+                 "panel 1", "fb 0", "msg " + batch(fill_at(140)), "dmg",       # the copy fails: none
+                 "fb 1"])
+    check("a copy with no framebuffer gives the panel back to stock: no presented notify, and the"
+          " next frame is not priced from it", (notifies(lines), dmg(lines)["lastPath"]), (1, 0))
 
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0

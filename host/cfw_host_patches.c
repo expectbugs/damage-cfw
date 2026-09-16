@@ -59,4 +59,5 @@ void host_damage_state(uint32_t *out) {
     out[15] = ctx->texture_cache ? damage_cache_size(ctx) : 0u;
     out[16] = ctx->dmg_last_path;
     out[18] = ctx->dmg_slot_bytes;
+    out[19] = ctx->dmg_direct_presented;   /* the F1.3 mark: whose frame the next refresh stamps */
 }

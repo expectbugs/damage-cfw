@@ -9,9 +9,13 @@
  *
  * To convert cycles->us we need the core clock. The guessed global 0x20074254 reads 0
  * on hardware (it's only written on a DVFS event, if ever), so instead we CALIBRATE:
- * measure how many CYCCNT cycles elapse across one edge of the firmware's 1 ms OS tick
- * (RAM 0x20074a34, SysTick chain) — that IS cycles-per-ms. Cached in the ctx; a bounded
- * spin falls back to 250 MHz if the tick never advances. All divides are 32-bit
+ * measure how many CYCCNT cycles elapse across one edge of the firmware's OS tick
+ * (RAM 0x20074a34, SysTick chain). That tick is NOT 1 ms: it runs 1.024 per wall-clock
+ * millisecond (measured 2026-09-15, Damage CLAIMS.md; a 1024 Hz tick), so the cycles
+ * across one edge are 2.34 % SHORT of a millisecond's and every microsecond figure
+ * derived from them read 2.4 % HIGH. The edge count is scaled by 1024/1000 here, so the
+ * figures the phase prices with are the wall-clock ones (2026-09-16 review). Cached in
+ * the ctx; a bounded spin falls back to 250 MHz if the tick never advances. All divides are 32-bit
  * (hardware UDIV) — a 64-bit divide would emit an external __aeabi_uldivmod build.py
  * rejects. (Limitation: cached across DVFS; a clock switch makes the figure ~stale.) */
 #define DWT_DEMCR   (*(volatile uint32_t *)0xE000EDFCU)  /* CoreDebug->DEMCR (TRCENA bit24) */
@@ -22,7 +26,7 @@
 #define DWT_UNLOCK_KEY 0xC5ACCE55U
 
 
-/* Calibrate DWT cycles-per-millisecond against the firmware's 1 ms OS tick, once,
+/* Calibrate DWT cycles-per-WALL-CLOCK-millisecond against the firmware's OS tick, once,
  * cached in the ctx. DWT must already be unlocked + enabled. Bounded spin across two
  * tick edges (~1-2 ms when the tick runs); returns 0 if the tick never advances (the
  * caller then falls back to an assumed clock). */
@@ -36,7 +40,10 @@ static uint32_t cfw_cyc_per_ms(customCfwContext *ctx) {
     g = 500000u;
     while (FW_MS_TICK == t1 && --g) ;               /* wait for the next edge (~1 ms) */
     if (g == 0) return 0;
-    ctx->cyc_per_ms = DWT_CYCCNT - c0;              /* cycles elapsed across one 1 ms tick */
+    /* cycles across one OS tick, scaled to a wall-clock millisecond: the tick is 1.024 per ms,
+     * so a tick's worth of cycles is 1000/1024 of a millisecond's. The product fits a uint32 for
+     * any core clock up to ~4.19 GHz, and the divide is the hardware UDIV. */
+    ctx->cyc_per_ms = ((DWT_CYCCNT - c0) * 1024u) / 1000u;
     return ctx->cyc_per_ms;
 }
 

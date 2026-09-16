@@ -92,7 +92,8 @@ typedef struct {
     uint8_t  diag_hide;  /* 1 = don't draw the flag overlay (default 0 = visible) */
     uint32_t last_worker_us;  /* image_worker() duration of the PREVIOUS message (overlay) */
     uint32_t last_present_us; /* present_shadow() duration of the PREVIOUS present (overlay) */
-    uint32_t cyc_per_ms;      /* calibrated DWT cycles per 1 ms OS tick (0 = not yet done) */
+    uint32_t cyc_per_ms;      /* calibrated DWT cycles per WALL-CLOCK ms (0 = not yet done); the OS
+                               * tick it is measured across is 1.024 per ms and debug.c scales for it */
     uint8_t  f_reorder;  /* FLAG: ever saw a frame id go backward */
     uint8_t  f_skip;     /* FLAG: ever saw a frame id gap (skipped) */
     uint8_t  f_dup;      /* FLAG: ever saw a duplicate frame id (in the recent ring) */
@@ -177,8 +178,12 @@ typedef struct {
      * damage_self_test_release keep their program order. The window that remains between
      * the two is the one the installed firmware already has for its texture cache. */
     uint8_t *volatile dmg_st_shadow;        /* PANEL_BYTES from heap 13, or 0 */
-    volatile uint8_t dmg_st_active;         /* a step is running: present_shadow returns without publishing */
-    volatile uint8_t dmg_st_free_pending;   /* a release arrived from another task during a step: the step's epilogue frees */
+    /* DMG_BUSY_*: one word, so a release point's "defer it" and the step's "I am done" cannot
+     * interleave. A separate active flag and pending flag left a window between the epilogue's
+     * last test of pending and its store of active = 0: a release landing there saw the mark up,
+     * deferred into a flag nothing would honour, and the scratch survived a release point
+     * (2026-09-16 review). Nonzero still reads as "a step is running" everywhere else. */
+    volatile uint8_t dmg_st_active;         /* DMG_BUSY_IDLE | DMG_BUSY_ACTIVE | DMG_BUSY_PENDING */
     uint8_t  dmg_st_refused;                /* the last step's message was refused */
     uint32_t dmg_st_seq;                    /* steps run since the begin */
     uint32_t dmg_st_crc;                    /* CRC-32 of the scratch shadow after the last step */
@@ -211,6 +216,12 @@ typedef struct {
                                              * every release point whether a cache was kept or not */
     volatile uint32_t dmg_ref_gen;          /* the refusal record's write count: odd while the image lane
                                              * writes fields 23-25, so the settings task never sends a mix */
+    /* The same shape for the two other records the settings task reads while another task
+     * writes them (2026-09-16 review). Without them a reply could carry one frame's
+     * microseconds with the previous frame's path, or a step's count with the previous step's
+     * CRC — and the step count is what `glassdrive.py selftest:` matches a vector against. */
+    volatile uint32_t dmg_frame_gen;        /* fields 15/26: the display task's transfer stamp and path */
+    volatile uint32_t dmg_st_gen;           /* fields 20-22: the self-test's count, result and scratch CRC */
     uint8_t  dmg_overlay_in_fb;             /* the last direct copy drew the diagnostic overlay into the
                                              * framebuffer: the next refresh after it is hidden is full */
     /* Second Phase 2 review (2026-09-15). A partial refresh (mode 24) sends only the hinted
@@ -227,16 +238,24 @@ typedef struct {
      * that lands meanwhile defers its free to the worker's epilogue, as a self-test step does
      * for the scratch. The window between a release's check and the worker's mark is the one
      * the installed firmware already has for its texture cache. */
-    volatile uint8_t dmg_slots_active;
-    volatile uint8_t dmg_slots_free_pending;
+    volatile uint8_t dmg_slots_active;      /* DMG_BUSY_*, as dmg_st_active above */
 } customCfwContext;
+
+/* The busy handshake between a task that is USING a buffer and a task that wants it FREED.
+ * One word with three states, moved with the atomics the part has (LDREXB/STREXB), because a
+ * check on one flag and a store to another can interleave (2026-09-16 review). */
+#define DMG_BUSY_IDLE    0u
+#define DMG_BUSY_ACTIVE  1u
+#define DMG_BUSY_PENDING 2u   /* in use, and a release point asked for the free */
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */
 #define CFW_ALLOC_DIAG_SLOT 0x202a6274U /* second word: magic | sticky failure bit */
 #define CFW_ALLOC_DIAG_MAGIC 0xA110CA7EU
-#define CFW_CTX_MAGIC 0xC0FFEE6BU    /* bumped for the context layout change (Damage Phase 2 fields) */
+#define CFW_CTX_MAGIC 0xC0FFEE6CU    /* bumped for the context layout change (Damage Phase 2 fields;
+                                      * again 2026-09-16: the two busy flags became one state word) */
 
-#define FW_MS_TICK  (*(volatile uint32_t *)0x20074a34U)  /* firmware 1 ms OS tick (SysTick chain) */
+#define FW_MS_TICK  (*(volatile uint32_t *)0x20074a34U)  /* firmware OS tick (SysTick chain): 1.024 per
+                                                          * wall-clock ms, measured (Damage CLAIMS.md) */
 
 static customCfwContext *peekCustomCfwContext(void);
 static customCfwContext *getCustomCfwContext(void);

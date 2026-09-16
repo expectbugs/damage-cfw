@@ -17,10 +17,12 @@ static customCfwContext *peekCustomCfwContext(void) {
  * slot ptr is range-checked to SRAM and the struct's magic verified before
  * trusting it, so warm-reset garbage can't be mistaken for a live context.
  * Returns 0 if the one-time struct malloc fails. */
-static customCfwContext *getCustomCfwContext(void) {
-    customCfwContext *ctx = peekCustomCfwContext();
-    if (ctx) return ctx;
-    ctx = (customCfwContext *)cfw_malloc(sizeof(customCfwContext));
+/* The one-time creation, kept OUT of line. getCustomCfwContext is inlined at two dozen call
+ * sites, and with the body here clang expanded the struct's zeroing into every one of them —
+ * 5.7 KB of the image, and a size that moved whenever a field was added (2026-09-16 review,
+ * measured: the struct grew 8 bytes and the image grew 5,716). Out of line it is one copy. */
+static __attribute__((noinline)) customCfwContext *cfw_context_create(void) {
+    customCfwContext *ctx = (customCfwContext *)cfw_malloc(sizeof(customCfwContext));
     if (ctx) {
         bzero((uint8_t *)ctx, sizeof(customCfwContext));
         ctx->magic = CFW_CTX_MAGIC;
@@ -29,4 +31,9 @@ static customCfwContext *getCustomCfwContext(void) {
     }
     *(customCfwContext **)CFW_CTX_SLOT = ctx;      /* 0 on OOM: retried next message */
     return ctx;
+}
+
+static customCfwContext *getCustomCfwContext(void) {
+    customCfwContext *ctx = peekCustomCfwContext();
+    return ctx ? ctx : cfw_context_create();
 }

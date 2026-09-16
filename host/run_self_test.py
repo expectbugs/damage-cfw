@@ -16,7 +16,10 @@ needs the lease held throughout (an acquire inside a vector is fine: the runner 
 12 or 19) inside a vector is sent as a LIVE message, not a step — a step writing the cache
 is refused by design, and the draws that follow read the live cache (13/14/17/18 do) — so
 its return code is the normal path's and the scratch is untouched. The Phase 2 control ops
-in a vector ({"flags": N}, {"cachesize": KiB}) go to the lens as they do on the normal path.
+in a vector ({"flags": N}, {"cachesize": KiB}) go to the lens AT THEIR OWN POSITION, as they do
+on the normal path: hoisting them all before the begin (as this did until 2026-09-16) is the same
+sequence only while they all precede the first message, and a differential fuzz writes vectors
+where they do not.
 """
 import json, pathlib, subprocess, sys, zlib
 
@@ -30,13 +33,10 @@ FC_ACQUIRE = bytes([ord('F'), ord('C'), 1, 5, 1, 0]).hex()
 
 def run_lens(vec, lens):
     lines = [f"lens {lens}", "tick 1000", "control " + FC_ACQUIRE]
-    # the vector's own control ops run before the begin, so DRAW2 and the cache size are in
-    # force for every step, as they are on the normal path (the sim's runner does the same)
+    # A release has no self-test form: the runner holds the lease throughout.
     for st in vec["steps"]:
         for op in st["ops"]:
-            if "flags" in op: lines.append("settings " + run_vectors.damage_control(2, int(op["flags"])))
-            elif "cachesize" in op: lines.append("settings " + run_vectors.damage_control(5, int(op["cachesize"])))
-            elif "lease" in op and op["lease"] != "acquire": return None    # a release: no self-test form (the runner holds the lease throughout)
+            if "lease" in op and op["lease"] != "acquire": return None
     lines += ["msg 1000", "crc"]
     per_step = []
     for st in vec["steps"]:
@@ -47,8 +47,12 @@ def run_lens(vec, lens):
                 lines.append(("msg " if mode in (12, 19) else "msg 1001") + op["msg"]); n += 1
             elif "tick" in op:
                 lines.append(f"tick {int(op['tick'])}")
-            elif "flags" in op or "cachesize" in op or "lease" in op:
-                pass                                   # sent above (an acquire: the runner holds the lease)
+            elif "flags" in op:
+                lines.append("settings " + run_vectors.damage_control(2, int(op["flags"])))
+            elif "cachesize" in op:
+                lines.append("settings " + run_vectors.damage_control(5, int(op["cachesize"])))
+            elif "lease" in op:
+                pass                                   # an acquire: the runner holds the lease throughout
             else:
                 sys.exit(f"{vec['name']}: op {op} has no self-test form")
         lines += ["dmg", "crc"]
@@ -68,7 +72,12 @@ def run_lens(vec, lens):
         d = next(it).split(); assert d[0] == "dmg", d
         c = next(it).split(); assert c[0] == "crc", c
         ref = ([int(d[13]), int(d[14]), int(d[15])] if d[12] != "0" else [0, 0, 0]) + [int(d[2])]
-        results.append((d[9], rcs, c[1], c[4], ref))       # scratch crc, rcs, live shadow crc, presents, the refusal record
+        # Fields 21/22 are sent "both after a step" (Damage FIRMWARE.md §3), so before the first
+        # one the record carries no CRC and the scratch is the zeroed shadow the begin allocated —
+        # which is what the normal path's all-zero shadow hashes to. Every vector in the set draws
+        # in its first step, so this only shows on a sequence that does not (2026-09-16 review).
+        scratch = d[9] if d[7] != "0" else ZERO_CRC        # d[7] = steps since the begin
+        results.append((scratch, rcs, c[1], c[4], ref))    # scratch crc, rcs, live shadow crc, presents, the refusal record
     return results
 
 def main(argv):
