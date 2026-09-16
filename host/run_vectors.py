@@ -8,6 +8,9 @@ format in Damage's FIRMWARE.md §9); Damage's Kotlin simulator runs the same fil
     python3 host/run_vectors.py --write                # fill the expectations from this C
     python3 host/run_vectors.py --dir PATH v1-cache    # one vector from another directory
 
+A vector carrying "panel": true also has the panel's CRC — what the lens shows, which a
+partial refresh (mode 24) updates only in its own rows — as "P" in every expectation.
+
 Each vector runs once per lens in its own harness process (each lens has its own RAM
 on the glasses). After every step the harness reports the shadow's CRC-32, the
 return code of every message, the last image-lane refusal recorded (Damage
@@ -50,7 +53,7 @@ def build():
             print(r.stderr.strip(), file=sys.stderr)
 
 def run_lens(vec, lens):
-    """Returns (crcs per step, rcs per step, notes)."""
+    """Returns (crcs per step, rcs per step, refs per step, panel CRCs per step, notes)."""
     lines = [f"lens {lens}"]
     per_step_msgs = []
     for st in vec["steps"]:
@@ -80,7 +83,7 @@ def run_lens(vec, lens):
     errors = [l for l in out if l.startswith("error")]
     if errors:
         sys.exit(f"{vec['name']} lens {lens}: {errors}")
-    crcs, rcs, refs, notes = [], [], [], []
+    crcs, rcs, refs, panels, notes = [], [], [], [], []
     it = iter(out)
     for n in per_step_msgs:
         step_rcs = []
@@ -98,9 +101,10 @@ def run_lens(vec, lens):
         d = next(it).split()
         assert d[0] == "dmg", d
         crcs.append(c[1])
+        panels.append(c[10])                              # what the lens shows (Damage FIRMWARE.md §9)
         rcs.append(step_rcs)
         refs.append(([int(d[13]), int(d[14]), int(d[15])] if d[12] != "0" else [0, 0, 0]) + [int(d[2])])
-    return crcs, rcs, refs, notes
+    return crcs, rcs, refs, panels, notes
 
 def main(argv):
     args = list(argv)
@@ -117,12 +121,15 @@ def main(argv):
     for f in files:
         vec = json.loads(f.read_text())
         res = {lens: run_lens(vec, lens) for lens in ("L", "R")}
-        for lens, (_, _, _, notes) in res.items():
+        for lens, (_, _, _, _, notes) in res.items():
             for n in notes:
                 print(f"  FAIL  {vec['name']} {lens}: {n}"); bad += 1
         for i, st in enumerate(vec["steps"]):
             got = {"L": res["L"][0][i], "R": res["R"][0][i], "rc": {"L": res["L"][1][i], "R": res["R"][1][i]},
                    "ref": {"L": res["L"][2][i], "R": res["R"][2][i]}}
+            # a vector marked "panel" is compared on what the lens SHOWS as well as on the shadow:
+            # a partial refresh (mode 24) transfers only its own rows (Damage FIRMWARE.md §9)
+            if vec.get("panel"): got["P"] = {"L": res["L"][3][i], "R": res["R"][3][i]}
             if write:
                 st["expect"] = got
             elif st.get("expect") != got:

@@ -116,8 +116,17 @@ commit.
   DRAW2 → record, mode 23 inside a step picks the self-test's slots by the step's mark (no swap), mode 16 records its
   refusals, the refusal record is read under a write count, and a hinted present is sent whole after a frame the
   panel-off path never transferred or while the overlay shows, the partial entry called with (0, 0, 0, y0, 640, y1).
+  **Pin `f9ddf49f…` after the second review of the same night (Damage `HANDOFF.md` §62; 31 entries, a 53,724-byte
+  block, 20 Thumb branches, 370 KB below the OTA flag; the same sites):** a partial refresh is taken only while the
+  panel still shows the whole previous frame — a message that held the display gate and presented nothing, stock
+  content in the framebuffer and every lease release point mark it stale, and the overlay switch is read once per
+  copy; the live save-under slots are marked busy on the worker so a release point on another task defers its free;
+  an image dropped because the gate came free with a frame still pending records reason 14; mode 19 re-reads each
+  entry's bounds inside its write loop; mode 18's second pass records its refusal; telemetry takes fields 15 and 26
+  together. The host harness now models the PANEL (a full refresh transfers the frame, a partial only its rows) and
+  can run a job's copy apart from its refresh (`split`), which is what proves a hint belongs to its own frame.
   The host harness models the JBD4010 and A6N-G records (`ops`), a held display job (`hold`) and the partial call's
-  arguments (`partial`); `test_damage_ext.py` (69 checks), `run_vectors.py` (the `flags`/`cachesize` ops, the `ref`
+  arguments (`partial`); `test_damage_ext.py` (75 checks), `run_vectors.py` (the `flags`/`cachesize` ops, the `ref`
   expectation) and `run_self_test.py` (a cache write sent live, the control ops before the begin, no PASS for a
   skipped vector) cover it; Damage's simulator matches the C on the 13 v2 vectors.
 

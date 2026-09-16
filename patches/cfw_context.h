@@ -68,7 +68,10 @@ typedef struct {
 #define DMG_REF_NO_BATCH  10u   /* a clip or a present hint outside a batch */
 #define DMG_REF_NO_MEMORY 11u   /* an allocation from heap 13 failed */
 #define DMG_REF_VALUE     12u   /* a sub-op, a LUT, a level or another value outside its range */
-#define DMG_REF_STREAM    13u   /* a zlib or RLE stream that does not decode to its size */
+#define DMG_REF_STREAM    13u   /* a zlib or RLE stream that does not decode to its size (an inflate whose
+                                 * state heap 13 could not give it among them) */
+#define DMG_REF_BUSY      14u   /* the display gate came free with the previous frame still pending: the
+                                 * message is dropped whole, nothing of it reaches the shadow */
 
 typedef struct {
     uint32_t magic;      /* CFW_CTX_MAGIC when valid */
@@ -210,6 +213,22 @@ typedef struct {
                                              * writes fields 23-25, so the settings task never sends a mix */
     uint8_t  dmg_overlay_in_fb;             /* the last direct copy drew the diagnostic overlay into the
                                              * framebuffer: the next refresh after it is hidden is full */
+    /* Second Phase 2 review (2026-09-15). A partial refresh (mode 24) sends only the hinted
+     * rows and leaves the rest of the panel as it was, so it is honoured only while the panel
+     * still shows the whole previous shadow. This is set wherever that stops being true: a
+     * gated message that changed the shadow without queueing a present (a refused batch, a
+     * queue call that failed), a stock copy into the framebuffer, and every lease release
+     * point. Written by the image worker and the display task under the display gate, and by
+     * a release point on another task — a set that crosses a copy is lost, and the fresh
+     * acquire that must follow a release sets it again before DRAW2 can be armed. */
+    volatile uint8_t dmg_panel_stale;
+    /* The live save-under slots (mode 23) are used by the image worker and freed at release
+     * points on other tasks. The worker marks the slots busy around every access; a release
+     * that lands meanwhile defers its free to the worker's epilogue, as a self-test step does
+     * for the scratch. The window between a release's check and the worker's mark is the one
+     * the installed firmware already has for its texture cache. */
+    volatile uint8_t dmg_slots_active;
+    volatile uint8_t dmg_slots_free_pending;
 } customCfwContext;
 
 #define CFW_CTX_SLOT  0x202a6270U    /* first word of the CFW-reserved TLSF tail */

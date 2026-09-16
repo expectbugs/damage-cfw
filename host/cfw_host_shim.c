@@ -30,7 +30,9 @@
  *                    stock BMP loader, which the host refuses)
  *   panel 0|1        the display task's panel-on word (0x004744a8): while 0, a type-3 refresh runs the
  *                    copy hook but skips the refresh call, as FUN_00473c44 does
- *   refresh          one stock type-3 refresh with no Damage job pending: the copy hook's stock path,
+ *   split 1|0        1: a job's copy hook runs and the gate goes back but its refresh waits (the window
+                    the next frame is queued in); 0: run it, then any job that waited behind it
+   refresh          one stock type-3 refresh with no Damage job pending: the copy hook's stock path,
  *                    then the refresh call through damage_refresh_hook (a pass-through unless a mark
  *                    was left) with a stock job's arguments (0, 0, 0, 0, 576, 288: FUN_00474066's four
  *                    callers) — the path every stock repaint takes on the glasses
@@ -96,6 +98,7 @@ void host_damage_state(uint32_t *out);
 #define BUF_A       0x20100000u   /* display buffer A: the 640x480 packed shadow lives here */
 #define BUF_B       0x20130000u   /* reconstruction buffer B */
 #define HOST_FB     0x20160000u   /* the physical framebuffer the hook copies into */
+#define HOST_PANEL  0x20190000u   /* what the lens shows: the panel the refresh transfers into */
 #define POOL_BASE   0x20300000u   /* FW_MALLOC's pool (the context must sit in firmware SRAM) */
 #define POOL_END    0x20340000u
 #define CARRIER_BYTES 165888u     /* 576 x 288, the EvenHub carrier's allocation */
@@ -107,6 +110,8 @@ void host_damage_state(uint32_t *out);
 static uint32_t lens_side = 1;          /* FW_SIDE(): 1 right, 2 left */
 static int panel_on = 1;                /* the display task's panel-on word (0x004744a8) */
 static int hold_jobs = 0, held_job = 0;
+static int split_jobs = 0, refresh_pending = 0;   /* the copy and the refresh of one job, apart */
+static uint32_t pending_refresh[6];
 static uint32_t held_args[6];
 static unsigned presents, gate_takes, gate_gives, bmp_calls, stock_copies, panel_refreshes, partial_refreshes;
 static uint32_t partial_last_a, partial_last_b, partial_last_x0, partial_last_y0, partial_last_x1, partial_last_y1;
@@ -156,9 +161,20 @@ static uint8_t *h_lookup(uint32_t id) { (void)id; return 0; }
 static int h_complete_emit(uint32_t id, void *hdr, int k, uint32_t p) { (void)id; (void)hdr; (void)k; (void)p; return 0; }
 static void h_display_wait(void) { gate_takes++; }
 static void h_display_signal(void) { gate_gives++; }
+/* The panel: what the wearer sees. A full refresh transfers the whole framebuffer into it,
+ * the JBD4010's partial entry only the rows it is given (Damage FIRMWARE.md §4, mode 24), so
+ * a hint that misses a changed row shows up here — the same model the Kotlin simulator keeps. */
+static void panel_rows(uint32_t y0, uint32_t y1) {
+    uint32_t stride = 320u;
+    if (y1 > 479u) y1 = 479u;
+    if (y0 > y1) return;
+    memcpy((void *)(uintptr_t)(HOST_PANEL + y0 * stride), (const void *)(uintptr_t)(HOST_FB + y0 * stride),
+           (size_t)(y1 - y0 + 1u) * stride);
+}
 static int h_panel_refresh(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f) {
     (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
     panel_refreshes++;
+    panel_rows(0, 479);
     *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * 1234u;   /* DWT CYCCNT: 1,234 µs at 250 cycles/µs */
     return 0;
 }
@@ -167,6 +183,7 @@ static int h_panel_refresh(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
  * +0x2c is a trap: the code must never call it (it moves no pixels on the glasses). */
 static int h_panel_partial(uint32_t a, uint32_t b, uint32_t c, uint32_t y0, uint32_t e, uint32_t y1) {
     partial_refreshes++;
+    panel_rows(y0, y1);
     partial_last_a = a; partial_last_b = b; partial_last_x0 = c; partial_last_x1 = e;
     partial_last_y0 = y0; partial_last_y1 = y1;
     *(volatile uint32_t *)(uintptr_t)0xE0001004u += 250u * (100u * (y1 - y0 + 1u) + 300u);
@@ -180,7 +197,7 @@ static int h_panel_partial_a6ng(uint32_t a, uint32_t b, uint32_t c, uint32_t d, 
 static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t w, uint32_t hh) {
     /* the display task: FUN_00473c44 type 3 runs the copy hook, gives the gate, then
      * (panel on) calls the refresh — through damage_refresh_hook since the F1.3 site */
-    if (hold_jobs) {
+    if (hold_jobs || refresh_pending) {   /* the task is busy: this job waits its turn */
         held_job = 1;
         held_args[0] = a; held_args[1] = b; held_args[2] = c; held_args[3] = d; held_args[4] = w; held_args[5] = hh;
         return 0;
@@ -188,6 +205,12 @@ static int h_display_queue(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint3
     presents++;
     display_copy_hook();
     gate_gives++;
+    if (split_jobs) {                     /* the refresh waits for `split 0`: the worker runs meanwhile */
+        refresh_pending = 1;
+        pending_refresh[0] = a; pending_refresh[1] = b; pending_refresh[2] = c;
+        pending_refresh[3] = d; pending_refresh[4] = w; pending_refresh[5] = hh;
+        return 0;
+    }
     if (panel_on) damage_refresh_hook(a, b, c, d, w, hh);   /* 0x00473cca: no refresh while the panel is off */
     return 0;
 }
@@ -198,7 +221,13 @@ static void h_stock_refresh(void) {
     display_copy_hook();
     if (panel_on) damage_refresh_hook(0, 0, 0, 0, 576, 288);
 }
-static void h_display_copy(void) { stock_copies++; }
+/* The stock 576x288 compositor copy: on the glasses it puts stock widget content into the
+ * framebuffer. Modeled as a pattern that is visibly not ours, so a partial refresh that leaves
+ * stock pixels around its rows is visible in the panel's CRC (2026-09-15, second review). */
+static void h_display_copy(void) {
+    stock_copies++;
+    memset((void *)(uintptr_t)HOST_FB, 0x5A, 153600u);
+}
 static int h_int_void(void) { return 0; }
 static int h_event_forward(uint32_t d, uint32_t e, void *v) { (void)d; (void)e; (void)v; return 0; }
 static int h_compass_notify(uint32_t h) { (void)h; return 0; }
@@ -331,11 +360,26 @@ int main(void) {
         } else if (!strncmp(line, "crc", 3)) {
             uLong s = crc32(0L, (const Bytef *)(uintptr_t)BUF_A, 153600u);
             uLong f = crc32(0L, (const Bytef *)(uintptr_t)HOST_FB, 153600u);
-            printf("crc %08lx %08lx presents %u gate %u/%u bmp %u\n", s, f, presents, gate_takes, gate_gives, bmp_calls);
+            uLong pn = crc32(0L, (const Bytef *)(uintptr_t)HOST_PANEL, 153600u);
+            printf("crc %08lx %08lx presents %u gate %u/%u bmp %u panel %08lx\n", s, f, presents, gate_takes, gate_gives, bmp_calls, pn);
         } else if (!strncmp(line, "panel ", 6)) {
             panel_on = line[6] != '0';
         } else if (!strncmp(line, "refresh", 7)) {
             h_stock_refresh();
+        } else if (!strncmp(line, "split ", 6)) {
+            /* 1: a job's copy hook runs and the gate goes back, but its refresh waits — the window
+             * in which the worker queues the NEXT frame, so a later job's hint cannot reach this
+             * job's refresh. 0: run the pending refresh, then whatever job waited behind it. */
+            split_jobs = line[6] != '0';
+            if (!split_jobs && refresh_pending) {
+                refresh_pending = 0;
+                if (panel_on) damage_refresh_hook(pending_refresh[0], pending_refresh[1], pending_refresh[2],
+                                                  pending_refresh[3], pending_refresh[4], pending_refresh[5]);
+                if (held_job) {
+                    held_job = 0;
+                    h_display_queue(held_args[0], held_args[1], held_args[2], held_args[3], held_args[4], held_args[5]);
+                }
+            }
         } else if (!strncmp(line, "hold ", 5)) {
             hold_jobs = line[5] != '0';
             if (!hold_jobs && held_job) {

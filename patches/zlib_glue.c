@@ -346,7 +346,13 @@ static int image_worker(void *state_, uint8_t *src, uint32_t srclen) {
     if (gated) {
         if (ctx == 0) return -1;
         FW_DISPLAY_WAIT();
-        if (ctx->direct_pending) return -1;          /* timed out; caller does not own gate */
+        if (ctx->direct_pending) {
+            /* The gate came free with the previous frame still pending (the wait ended early):
+             * the message is dropped whole and nothing of it reaches the shadow. Recorded, so
+             * the phone sees it — the ack went out before the decode (Damage FIRMWARE.md §4). */
+            damage_refuse(src, DMG_REF_BUSY);
+            return -1;                               /* caller does not own gate */
+        }
     }
 
     uint32_t t;
@@ -354,7 +360,15 @@ static int image_worker(void *state_, uint8_t *src, uint32_t srclen) {
     int r = image_dispatch((uint8_t *)state_, src, srclen, 1, &rl);
     uint32_t us = cfw_time_end(&t);
 
-    if (gated && !rl.direct_submitted) FW_DISPLAY_SIGNAL();
+    if (gated && !rl.direct_submitted) {
+        /* Nothing was queued for the display task, so whatever this message changed in the
+         * shadow — a batch refused part-way, a queue call that failed — is not on the panel.
+         * The next hinted present (mode 24) would send only its own rows and leave those
+         * changes off the panel, so the panel counts as stale until a full refresh sends the
+         * whole frame again (2026-09-15, second review). */
+        ctx->dmg_panel_stale = 1;
+        FW_DISPLAY_SIGNAL();
+    }
     if (ctx) ctx->last_worker_us = us;
     return r;
 }
@@ -948,8 +962,11 @@ void display_copy_hook(void) {
         }
         /* F1.3 (damage_ext.c): the framebuffer is about to hold stock content, so the
          * refresh that follows is not a Damage frame's transfer. A mark left by a direct
-         * copy whose refresh the display task skipped (panel off) must not stamp it. */
-        if (ctx) { ctx->dmg_direct_presented = 0; ctx->dmg_hint_r_on = 0; ctx->dmg_hint_q_on = 0; }
+         * copy whose refresh the display task skipped (panel off) must not stamp it. The
+         * panel is about to show stock content, so the next Damage frame goes whole: a
+         * partial refresh would leave stock pixels around its rows (2026-09-15, second
+         * review — it did, on the host, after a BMP fallback). */
+        if (ctx) { ctx->dmg_direct_presented = 0; ctx->dmg_hint_r_on = 0; ctx->dmg_hint_q_on = 0; ctx->dmg_panel_stale = 1; }
         FW_DISPLAY_COPY();
         return;
     }
@@ -958,19 +975,28 @@ void display_copy_hook(void) {
     uint8_t *fb = FW_DISPLAY_FB;
     uint32_t t;
     cfw_time_start(&t);
+    /* Read the overlay switch ONCE: mode 7 sub 1/2 runs on the image task and is not gated, so
+     * three reads could disagree inside one copy and leave the overlay's rows on the panel
+     * (2026-09-15, second review). The one value decides the draw, the hint and the mark. */
+    uint8_t hide = ctx->diag_hide;
     int ok = fb != 0;
     if (ok) {
         copy_panel(fb, shadow);
-        cfw_draw_flags(fb, PANEL_W, PANEL_H);
+        if (!hide) cfw_draw_flags(fb, PANEL_W, PANEL_H);
     }
 
     /* Damage mode 24: the job's hint is latched for the refresh that follows this copy — a
      * later job's hint, queued once the gate is given back, waits for its own copy. The rows
-     * cover this frame's changes only: when the previous direct frame was never transferred (its
-     * refresh skipped, the panel off — its mark still stands) or the diagnostic overlay is drawn
-     * into the framebuffer, the refresh is full (2026-09-15 review). */
-    ctx->dmg_hint_r_on = (ctx->dmg_hint_q_on && !ctx->dmg_direct_presented && ctx->diag_hide && !ctx->dmg_overlay_in_fb) ? 1u : 0u;
-    ctx->dmg_overlay_in_fb = ctx->diag_hide ? 0u : 1u;   /* hidden now: once this full refresh sends the frame, the overlay is gone */
+     * cover this frame's changes only, so the hint is honoured only while the panel still shows
+     * the whole previous frame: when the previous direct frame was never transferred (its
+     * refresh skipped, the panel off — its mark still stands), when the shadow changed without
+     * being presented or stock content reached the framebuffer (dmg_panel_stale), or when the
+     * diagnostic overlay is drawn into the framebuffer, the refresh is full (2026-09-15 review,
+     * and its second pass). */
+    ctx->dmg_hint_r_on = (ctx->dmg_hint_q_on && !ctx->dmg_direct_presented && !ctx->dmg_panel_stale &&
+                          hide && !ctx->dmg_overlay_in_fb) ? 1u : 0u;
+    ctx->dmg_panel_stale = 0;                            /* this frame goes whole unless its own hint stands */
+    ctx->dmg_overlay_in_fb = hide ? 0u : 1u;             /* hidden now: once this full refresh sends the frame, the overlay is gone */
     ctx->dmg_hint_r_y0 = ctx->dmg_hint_q_y0;
     ctx->dmg_hint_r_y1 = ctx->dmg_hint_q_y1;
     ctx->dmg_hint_q_on = 0;
@@ -986,6 +1012,7 @@ void display_copy_hook(void) {
         ctx->direct_active = 0;
         ctx->direct_failed = 1;
         ctx->dmg_hint_r_on = 0;
+        ctx->dmg_panel_stale = 1;                    /* stock content is going to the panel instead */
         FW_DISPLAY_COPY();
     }
     ctx->last_present_us = cfw_time_end(&t);

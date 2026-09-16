@@ -278,6 +278,22 @@ void damage_slots_free(damage_slot *slots, uint32_t *bytes) {
     *bytes = 0;
 }
 
+/* The live slots are freed at lease release points, which run on the settings task and the
+ * input thread, while mode 23 uses them on the image worker. The worker marks them busy
+ * around every access (2026-09-15, second review: without the mark both tasks could free the
+ * same buffer, and a restore could read one that had been freed under it); a release that
+ * lands during the mark is deferred to the epilogue below, as a self-test step defers the
+ * scratch's. The fields are volatile so the mark-then-access and the check-then-free keep
+ * their program order. */
+static void damage_slots_enter(customCfwContext *ctx) { ctx->dmg_slots_active = 1; }
+
+static void damage_slots_leave(customCfwContext *ctx) {
+    ctx->dmg_slots_active = 0;
+    if (!ctx->dmg_slots_free_pending) return;
+    ctx->dmg_slots_free_pending = 0;
+    damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
+}
+
 
 /* ---- the ops ------------------------------------------------------------------------------ */
 
@@ -358,7 +374,11 @@ static int damage_op_string(customCfwContext *ctx, uint8_t *shadow, uint32_t str
         uint32_t ch = string[i];
         if (ch <= 31u) { x += (int32_t)ch - 11; continue; }
         cfw_cached_image g;
-        if (!damage_image1_at(ctx, rd16(table + (ch - 32u) * 2u) * 4u, &g)) return -1;   /* validated above */
+        if (!damage_image1_at(ctx, rd16(table + (ch - 32u) * 2u) * 4u, &g)) {
+            /* validated above: only a release point on another task freeing the cache between
+             * the two passes reaches this, and it is recorded like any other refusal */
+            damage_refuse(src, DMG_REF_RECORD); return -1;
+        }
         damage_render_runs(shadow, stride, &c, x, y, g.rle, g.rle_len, g.width, g.height, lut, transparent);
         damage_add_rect(rl, &c, x, y, g.width, g.height);
         x += (int32_t)g.width;
@@ -406,6 +426,10 @@ static int damage_op_cache_write(customCfwContext *ctx, const uint8_t *src, uint
         uint32_t off = rd16(src + pos) * 4u;
         uint32_t len = rd16(src + pos + 2u);
         pos += 4u;
+        /* the bound is re-read here, not carried from the pass above: the message sits in the
+         * receiver's buffer, which a later message can reach (the snapshot tail), so the bytes
+         * this loop indexes with are the bytes it writes with */
+        if (off > size || len > size - off) { damage_refuse(src, DMG_REF_RECORD); return -1; }
         for (uint32_t i = 0; i < len; i++) ctx->texture_cache[off + i] = src[pos + i];
         pos += len;
     }
@@ -491,6 +515,10 @@ static int damage_op_lut(customCfwContext *ctx, uint8_t *shadow, uint32_t stride
  * the self-test's set; nothing is swapped, so a release point on another task that frees the
  * live set can never meet the self-test's slots under its hands (2026-09-15 review).
  * Returns 1 when the shadow changed (a restore), 0 for a capture or a free, -1 refused. */
+static int damage_save_apply(customCfwContext *ctx, int st, uint32_t slot, uint32_t sub,
+                             uint8_t *shadow, uint32_t stride, uint32_t panel_w, uint32_t panel_h,
+                             const uint8_t *src, cfw_rectlist *rl, int lenses_differ);
+
 static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t stride,
                           uint32_t panel_w, uint32_t panel_h, const uint8_t *src, uint32_t srclen,
                           cfw_rectlist *rl, int lenses_differ) {
@@ -504,6 +532,21 @@ static int damage_op_save(customCfwContext *ctx, uint8_t *shadow, uint32_t strid
     if (sub > 2u) { damage_refuse(src, DMG_REF_VALUE); return -1; }
     if (slot >= DMG_SLOTS) { damage_refuse(src, DMG_REF_SCRATCH); return -1; }
     int st = ctx->dmg_st_active != 0;
+    /* The live set is freed at release points on other tasks: mark it busy for the access
+     * below, so such a release is deferred to damage_slots_leave instead of freeing a buffer
+     * this op is reading or has just published. The self-test's set is already covered by the
+     * step's own mark. */
+    if (!st) damage_slots_enter(ctx);
+    int r = damage_save_apply(ctx, st, slot, sub, shadow, stride, panel_w, panel_h, src, rl, lenses_differ);
+    if (!st) damage_slots_leave(ctx);
+    return r;
+}
+
+/* The slot work of mode 23, under the busy mark for the live set. Returns 1 when the shadow
+ * changed (a restore), 0 for a capture or a free, -1 refused. */
+static int damage_save_apply(customCfwContext *ctx, int st, uint32_t slot, uint32_t sub,
+                             uint8_t *shadow, uint32_t stride, uint32_t panel_w, uint32_t panel_h,
+                             const uint8_t *src, cfw_rectlist *rl, int lenses_differ) {
     damage_slot *s = st ? &ctx->dmg_st_slots[slot] : &ctx->dmg_slots[slot];
     uint32_t *pool = st ? &ctx->dmg_st_slot_bytes : &ctx->dmg_slot_bytes;
     if (sub == 2u) { damage_slot_free(s, pool); return 0; }

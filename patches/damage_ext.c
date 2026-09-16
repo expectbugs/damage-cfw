@@ -27,7 +27,9 @@
  *   modes 17-24 (image lane) the drawing contract v2 (damage_draw.c), behind flag bit 2 DRAW2
  *   op 5 CACHE_SIZE          the session's texture-cache size in KiB, set before the first
  *                            write: status 3 with no lease, 4 once the cache is allocated,
- *                            5 over the budget (160 KiB) or zero; field 18 reports the size
+ *                            5 outside 64..160 KiB (modes 12/13/14 bound their records by the
+ *                            first 64 KiB, so a smaller cache would put those bounds past its
+ *                            end); field 18 reports the size the allocation took
  *
  * Phase 2 (contract 2, Damage FIRMWARE.md §4): a FLAGS_SET with no lease held is refused with
  * status 3 (Adam's ruling, 2026-09-15); every image-lane refusal records its mode byte, a
@@ -38,7 +40,8 @@
  *
  * Flags (bit 15 PROBE has no behaviour): bit 0 PRESENTED sends field 113 after each
  * direct present; bit 1 CACHE_KEEP keeps the texture cache across the next lease
- * lapse and the fresh acquire that follows it. A FLAGS_SET naming any other bit
+ * lapse and the fresh acquire that follows it. A FLAGS_SET with no lease held is refused
+ * with status 3 before anything else; one naming a bit this build does not implement
  * changes nothing and records status 2. Flags clear wherever the texture cache
  * would be released (lease expiry, FB_RELEASE, a fresh acquire, mode 11).
  *
@@ -94,9 +97,10 @@
  * flags themselves clear at every release point whether the lapse was settled before it
  * or not. The phone re-arms the flag every session; a session that
  * does not re-arm it gets upstream's behaviour at the next lapse. Mode 11 (the
- * hand-back to stock) frees the cache regardless. dmg_cache_gen counts the mode-12
- * writes that changed the cache (texture_cache.c); CACHE_INFO adds the CRC-32 of the
- * whole 64 KiB so the phone can tell whether what it uploaded is still there.
+ * hand-back to stock) frees the cache regardless. dmg_cache_gen counts the
+ * cache writes that changed it (texture_cache.c mode 12, damage_draw.c mode 19); CACHE_INFO
+ * adds the CRC-32 of the whole allocated size (op 5's, 64 KiB unless asked otherwise) so the
+ * phone can tell whether what it uploaded is still there.
  *
  * ---- The self-test (mode 16) -----------------------------------------------------------
  * [16][0] allocates and zeroes a scratch shadow (PANEL_BYTES from heap 13) while the
@@ -213,11 +217,17 @@ static void damage_self_test_release(customCfwContext *ctx) {
 }
 
 /* The live save-under slots and the size asked for, at every release point. A step never
- * touches the live slots (mode 23 takes the self-test's set while one runs), so they are freed
- * at once; the size asked for goes whether the cache went or was kept by CACHE_KEEP. */
+ * touches the live slots (mode 23 takes the self-test's set while one runs), but a live mode 23
+ * on the image worker does, and this runs on the settings task or the input thread: a free that
+ * lands while the worker holds the slots is deferred to the worker's epilogue, as a step's is
+ * for the scratch (2026-09-15, second review). The size asked for goes whether the cache went
+ * or was kept by CACHE_KEEP. The panel is stock's again after a release, so the next Damage
+ * frame goes whole rather than through a partial refresh (mode 24). */
 static void damage_live_slots_release(customCfwContext *ctx) {
-    damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
+    if (ctx->dmg_slots_active) ctx->dmg_slots_free_pending = 1;
+    else damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
     ctx->dmg_cache_req = 0;
+    ctx->dmg_panel_stale = 1;
 }
 
 /* The end of a begin or a step: the active mark drops, and a release that landed
@@ -311,6 +321,11 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
     unsigned n = 0;
     int leased = cfw_fb_lease_active();          /* notices a lapse first: flags then read 0 */
     uint32_t tick = FW_MS_TICK;
+    /* The display task writes both of these at the end of a refresh: take them together, so a
+     * refresh between the two fields cannot pair one frame's microseconds with the next
+     * frame's path (2026-09-15, second review). */
+    uint32_t transfer_us = ctx->dmg_last_transfer_us;
+    uint32_t last_path = ctx->dmg_last_path;
     n += damage_put_varint_field(body + n, 1, request_id);
     n += damage_put_varint_field(body + n, 2, tick);
     n += damage_put_varint_field(body + n, 3, ctx->dmg_flags);
@@ -334,7 +349,7 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
     n += damage_put_varint_field(body + n, 12, left);
     /* field 13 (boot count): not sent — see the header comment */
     n += damage_put_varint_field(body + n, 14, FW_SIDE_ID());
-    n += damage_put_varint_field(body + n, 15, ctx->dmg_last_transfer_us);
+    n += damage_put_varint_field(body + n, 15, transfer_us);
     n += damage_put_varint_field(body + n, 16, ctx->dmg_present_seq);
     n += damage_put_varint_field(body + n, 17, ctx->dmg_cache_gen);
     if (ctx->texture_cache) {
@@ -364,7 +379,7 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
         }
         break;
     }
-    n += damage_put_varint_field(body + n, 26, ctx->dmg_last_path);
+    n += damage_put_varint_field(body + n, 26, last_path);
     damage_send_package(ctx->dmg_reply_buf, sizeof(ctx->dmg_reply_buf), DMG_TELEMETRY_FIELD, body, n);
 }
 

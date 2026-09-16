@@ -415,6 +415,69 @@ def main():
     lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "msg 10", "dmg"])
     check("a mode-16 message with no sub-op records its refusal (1)", (dmg(lines)["refMode"], dmg(lines)["refReason"]), (16, 1))
 
+    print("-- the second Phase 2 review (2026-09-15): the panel behind a partial refresh")
+    def panel_crc(lines):
+        l = [x for x in lines if x.startswith("crc ")][-1].split()
+        return {"shadow": l[1], "fb": l[2], "panel": l[10]}
+    bad_draw = bytes([17]) + (0xFFFF).to_bytes(2, "little") + bytes([0, 0, 0, 0, 0x0F])   # a record past any cache: refused 5
+    # A batch that is refused part-way has already changed the shadow and presents nothing. The
+    # rows it changed are not on the panel, so the next hinted present must send the whole frame
+    # (FIRMWARE.md §4, mode 24) — otherwise those rows stay stale until some later full refresh.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "crc",
+                 "msg " + batch(fill_at(0), bad_draw), "dmg", "crc",
+                 "msg " + batch(hint(200, 209), fill_at(200)), "dmg", "crc", "partial"])
+    d = [dmg(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("dmg ")]
+    c = [panel_crc(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("crc ")]
+    check("a batch refused part-way changes the shadow and presents nothing: the hinted frame after it is sent whole",
+          (rcs(lines), d[1]["lastPath"], d[1]["partials"], c[2]["panel"] == c[2]["fb"]), ([0, -1, 0], 0, 0, True))
+    # The same rule for stock content: after the lease lapses the stock compositor repaints, so
+    # the panel is no longer the previous Damage frame.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "msg " + batch(hint(100, 109), fill_at(100)), "partial",
+                 "tick 200000", "refresh",
+                 "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + batch(hint(220, 229), fill_at(220)), "dmg", "crc", "partial"])
+    pcalls = [[int(v) for v in l.split()[1:]] for l in lines if l.startswith("partial ")]
+    check("a stock repaint puts stock content on the panel: the first hinted frame after it is sent whole",
+          (pcalls[0][0], pcalls[1][0], dmg(lines)["lastPath"], panel_crc(lines)["panel"] == panel_crc(lines)["fb"]),
+          (1, 1, 0, True))
+    # And after an explicit release, whose fresh acquire follows.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "settings " + FC_RELEASE.hex(), "settings " + FC_ACQUIRE.hex(),
+                 "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + batch(hint(100, 109), fill_at(100)), "dmg", "partial"])
+    check("the first hinted frame of a session that follows a release is sent whole",
+          (partial(lines)[0], dmg(lines)["lastPath"]), (0, 0))
+    # The gate came free with the previous frame still pending: the message is dropped whole and
+    # recorded (reason 14), and nothing of it reaches the shadow.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "crc", "hold 1", "msg " + batch(hint(100, 109), fill_at(100)),
+                 "msg " + batch(fill_at(220)), "dmg", "crc", "hold 0"])
+    c = [panel_crc(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("crc ")]
+    check("a gated message that finds the previous frame still pending is dropped whole and recorded (14)",
+          (rcs(lines)[-1], (dmg(lines)["refMode"], dmg(lines)["refReason"]), c[0]["shadow"] != c[1]["shadow"]),
+          (-1, (8, 14), True))
+    # One job's hint belongs to that job's refresh: the worker queues the next frame in the window
+    # between a copy and its refresh, and the hint the copy latched is the one that runs.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "split 1",
+                 "msg " + batch(hint(100, 109), fill_at(100)),      # copied; its refresh waits
+                 "msg " + batch(hint(220, 229), fill_at(220)),      # queued in that window
+                 "split 0", "partial", "dmg", "crc"])
+    pcalls = [[int(v) for v in l.split()[1:]] for l in lines if l.startswith("partial ")]
+    check("the hint a copy latched runs with that copy's refresh, not with a later frame's",
+          (pcalls[-1][0], panel_crc(lines)["panel"] == panel_crc(lines)["fb"]), (2, True))
+    # The panel model itself: a partial refresh transfers its rows and nothing else, so a hint
+    # that misses a row the same batch changed leaves that row stale — this is what the phone's
+    # own model has to reproduce, and why a short hint fails the oracle before it reaches glass.
+    lines = run(["lens R", "tick 1000", "settings " + FC_ACQUIRE.hex(), "settings " + control(OP_FLAGS_SET, FLAG_DRAW2).hex(),
+                 "msg " + kf, "crc", "msg " + batch(hint(100, 109), fill_at(100), fill_at(240)), "crc", "dmg",
+                 "msg " + batch(fill_at(120)), "crc"])
+    c = [panel_crc(lines[:i + 1]) for i, l in enumerate(lines) if l.startswith("crc ")]
+    check("a hint that misses a row the batch changed leaves it off the panel; the next full refresh brings the panel back to the framebuffer",
+          (dmg(lines)["lastPath"], c[1]["panel"] == c[1]["fb"], c[2]["panel"] == c[2]["fb"]), (1, False, True))
+
     print("RESULT: " + ("all pass" if not fails else f"{fails} failure(s)"))
     return 1 if fails else 0
 
