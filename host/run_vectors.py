@@ -119,6 +119,7 @@ def main(argv):
     build()
     bad = 0
     for f in files:
+        bad_before = bad
         vec = json.loads(f.read_text())
         res = {lens: run_lens(vec, lens) for lens in ("L", "R")}
         for lens, (_, _, _, _, notes) in res.items():
@@ -138,7 +139,10 @@ def main(argv):
         if write:
             f.write_text(json.dumps(vec, indent=1) + "\n")
             print(f"  wrote {f.name}: {len(vec['steps'])} steps")
-        elif not bad:
+        elif bad == bad_before:
+            # `bad` is cumulative: reading it bare meant one early mismatch silenced the PASS line
+            # of every vector after it, so nothing said the rest had run (2026-09-15, the third
+            # review; run_self_test.py already had this shape)
             print(f"  PASS  {vec['name']}: {len(vec['steps'])} steps, both lenses")
     if bad:
         print(f"RESULT: {bad} mismatch(es)"); return 1

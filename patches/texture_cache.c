@@ -257,9 +257,17 @@ static int cfw_texture_cache_update(const uint8_t *src, uint32_t len) {
 
     pos = 0;
     while (pos < len) {
+        /* The bounds are re-checked here, not carried from the pass above: this loop re-reads the
+         * entry header from the message, the message sits in the receiver's buffer, and a later
+         * message can reach that buffer (the snapshot tail) — so the bytes it indexes with must be
+         * the bytes it checked. Mode 19 was given this in the second review (damage_draw.c); mode
+         * 12 writes through the same pointer and had not (2026-09-15, the third review). */
+        if (len - pos < 4u) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
         uint32_t offset = rd16(src + pos);
         uint32_t entry_len = rd16(src + pos + 2u);
         pos += 4u;
+        if (entry_len > len - pos) { damage_refuse(msg, DMG_REF_LENGTH); return -1; }
+        if (offset + entry_len > CFW_TEXTURE_CACHE_SIZE) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         for (uint32_t i = 0; i < entry_len; i++)
             ctx->texture_cache[offset + i] = src[pos + i];
         pos += entry_len;
@@ -340,10 +348,15 @@ static int cfw_texture_draw_string(uint8_t *shadow, uint32_t stride,
             x += (int32_t)ch - 11;
             continue;
         }
-        uint32_t image_offset = rd16(table + (ch - 32u) * 2u);
+        /* `table` is re-derived from the published pointer, and the refusal is recorded: a
+         * release point on another task (the settings task, the input thread) can free the cache
+         * between the two passes, so this pass can fail — silently, until now (2026-09-15, the
+         * third review; mode 18 was given the same in the second). */
+        if (ctx->texture_cache == 0) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
+        const uint8_t *tbl = ctx->texture_cache + font_offset;
+        uint32_t image_offset = rd16(tbl + (ch - 32u) * 2u);
         cfw_cached_image image;
-        /* Already validated above; cache contents cannot change in this handler. */
-        if (!cfw_texture_image_at(ctx, image_offset, &image)) return -1;
+        if (!cfw_texture_image_at(ctx, image_offset, &image)) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         cfw_texture_render(shadow, stride, panel_w, panel_h, x, y, &image,
                            lut, transparent);
         cfw_texture_add_rect(rl, x, y, image.width, image.height, panel_w, panel_h);
@@ -508,9 +521,11 @@ static int cfw_builtin_draw_string(uint8_t *shadow, uint32_t stride,
         }
         uint8_t dsc[CFW_GLYPH_DSC_SIZE];
         const uint8_t *bitmap;
+        /* recorded: the first pass validated every glyph, but the font's own state is not this
+         * task's alone (2026-09-15, the third review — the same omission mode 14 had) */
         if (!cfw_builtin_glyph(font, tokens[i],
                                cfw_texture_next_glyph(tokens, token_count, i),
-                               dsc, &bitmap)) return -1;
+                               dsc, &bitmap)) { damage_refuse(msg, DMG_REF_RECORD); return -1; }
         uint32_t box_w = rd16(dsc + CFW_GLYPH_BOX_W);
         uint32_t box_h = rd16(dsc + CFW_GLYPH_BOX_H);
         int32_t gx = x + cfw_texture_s16(dsc + CFW_GLYPH_OFS_X);

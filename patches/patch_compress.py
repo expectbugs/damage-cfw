@@ -193,13 +193,28 @@ WEAR_NOTIFY_BL_SITES = {
 # EvenHub active instead, so redirect through a wrapper that preserves the stock call
 # and additionally invokes that notifier while mode 10 owns the compass.
 COMPASS_EVENT_BL_SITE = (0x443288, "1c f0 38 fb")  # bl FUN_0045f8fc(display,0x41,&heading)
-# The display task's type-3 refresh: `bl FUN_004ca564` (the ULED manager's refresh
-# dispatcher; r0-r3 plus two stack words) at 0x473ce4, after the copy hook (0x473c8e)
-# and the gate give (0x473c92). Redirected to damage_refresh_hook, a pass-through
-# for every stock refresh that stamps the transfer of a Damage frame (FIRMWARE.md F1.3).
-# The type-6 case's own call at 0x473d80 is left alone: Damage presents are type 3.
-# Stock bytes read from the image: f056 fc3e (Damage research/fwread.py dis 0x473c44).
-DISPLAY_REFRESH_BL_SITE = (0x473ce4, "56 f0 3e fc")
+# The display task's refresh calls: `bl FUN_004ca564` (the ULED manager's refresh dispatcher;
+# r0-r3 plus two stack words), redirected to damage_refresh_hook -- a pass-through for every
+# stock refresh that stamps the transfer of a Damage frame (FIRMWARE.md F1.3) and, since Phase 2,
+# sends its hinted rows through the panel record's partial entry (mode 24).
+#   0x473ce4  the type-3 branch, after the copy hook (0x473c8e) and the gate give (0x473c92)
+#   0x473d80  the type-6 branch, after ITS copy hook (0x473d68) and gate give (0x473d6c)
+# BOTH copy sites have always been hooked, and display_copy_hook does not know the event type:
+# a type-6 event that runs while a Damage job is pending takes that frame into the framebuffer
+# and latches its hint. Leaving its refresh alone (as the comment here used to, on the reasoning
+# that "Damage presents are type 3") meant those frames transferred with no stamp -- fields 15
+# and 26 kept the PREVIOUS frame's microseconds and path while field 16 advanced, and no
+# presented notify went out for them -- and their hint was dropped (2026-09-15, the third
+# review). Not a display defect either way: every clear of dmg_direct_presented clears the hint
+# with it, so a stale hint cannot reach a later frame. THIS IS THE ONE NEW PATCH SITE OF THE
+# review -- FORK.md Sec 3.1: FUN_00473c44 is the display task's event loop, not a boot-time path,
+# and it is already patched at three points.
+# Stock bytes read from the image (Damage research/fwread.py dis 0x473c44 0x473dc0):
+#   0x473ce4  f056 fc3e   0x473d80  f056 fbf0
+DISPLAY_REFRESH_BL_SITES = {
+    0x473ce4: "56 f0 3e fc",
+    0x473d80: "56 f0 f0 fb",
+}
 
 def enc_bl(pc, target):
     """Encode a Thumb-2 BL (T1) from instruction address `pc` to `target`."""
@@ -390,9 +405,9 @@ def layout(img):
         (g2f(COMPASS_EVENT_BL_SITE[0]), COMPASS_EVENT_BL_SITE[1],
          enc_bl(COMPASS_EVENT_BL_SITE[0], compass_event_addr),
          "bl compass_event_forward (global IMU heading -> stock nav BLE notifier)"),
-        (g2f(DISPLAY_REFRESH_BL_SITE[0]), DISPLAY_REFRESH_BL_SITE[1],
-         enc_bl(DISPLAY_REFRESH_BL_SITE[0], refresh_hook_addr),
-         "bl damage_refresh_hook @ 0x473ce4 (the panel-transfer stamp of a Damage frame; a pass-through otherwise)"),
+        *[(g2f(site), orig, enc_bl(site, refresh_hook_addr),
+           f"bl damage_refresh_hook @ {site:#x} (the panel-transfer stamp of a Damage frame; a pass-through otherwise)")
+          for site, orig in DISPLAY_REFRESH_BL_SITES.items()],
     ]
     return bytes(append), in_place, (idx, comp_off, old_ps)
 

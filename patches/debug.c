@@ -131,8 +131,12 @@ static void append_free_kib(char *out, uint32_t free_bytes, uint32_t maxlen) {
  * 0x2013be70, 0x20208e70, and 0x20279670 respectively. Suppressed when diag_hide is set
  * (mode 7). Drawn into the physical packed-4bpp framebuffer. */
 static void cfw_draw_flags(uint8_t *disp, uint32_t w, uint32_t h) {
+    /* The switch is read ONCE per copy, by the caller (zlib_glue.c display_copy_hook): the one
+     * value decides the draw, the hint and the mark. A second read here could disagree with it
+     * and cost a full refresh for an overlay that was not drawn (2026-09-15, the third review
+     * — the second review's "read once" was not literally true). */
     customCfwContext *ctx = getCustomCfwContext();
-    if (ctx == 0 || ctx->diag_hide) return;
+    if (ctx == 0) return;
 
     char line[96]; line[0] = 0;
     uint32_t num_flags = 0;

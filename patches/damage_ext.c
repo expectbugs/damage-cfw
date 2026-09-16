@@ -150,7 +150,7 @@
 #define DMG_STATUS_UNSUPPORTED 2u
 #define DMG_STATUS_NO_LEASE   3u
 #define DMG_STATUS_ALLOCATED  4u             /* CACHE_SIZE while the cache is up: the size stands */
-#define DMG_STATUS_BUDGET     5u             /* CACHE_SIZE of zero or over the budget */
+#define DMG_STATUS_BUDGET     5u             /* CACHE_SIZE outside 64..160 KiB */
 #define DMG_CACHE_BUDGET_KIB  160u           /* budget A (Damage FIRMWARE.md §4) */
 #define DMG_CACHE_MIN_KIB     64u            /* modes 12/13/14 bound their records by the first 64 KiB */
 #define DMG_ST_BEGIN          0u
@@ -207,13 +207,20 @@ void damage_clear_flags(customCfwContext *ctx) {
  * are volatile (cfw_context.h) so the step's mark-then-read and this check-then-free
  * keep their program order; the window between a release's check and a step's mark is
  * the same one the installed firmware has for its texture cache and is left as it is. */
+/* The free itself, with no mark to consult: called by the release below when no step is running,
+ * and by the step's own epilogue while its mark is still up. The scratch pointer is claimed with
+ * an exchange, so two tasks reaching a release point together cannot both take it and hand the
+ * same heap-13 block back twice (2026-09-15, the third review). */
+static void damage_self_test_free(customCfwContext *ctx) {
+    uint8_t *shadow = __atomic_exchange_n(&ctx->dmg_st_shadow, (uint8_t *)0, __ATOMIC_SEQ_CST);
+    if (shadow) cfw_heap13_free(shadow);
+    damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* the self-test's save-under slots */
+}
+
 static void damage_self_test_release(customCfwContext *ctx) {
     if (ctx == 0) return;
     if (ctx->dmg_st_active) { ctx->dmg_st_free_pending = 1; return; }
-    uint8_t *shadow = ctx->dmg_st_shadow;
-    ctx->dmg_st_shadow = 0;
-    if (shadow) cfw_heap13_free(shadow);
-    damage_slots_free(ctx->dmg_st_slots, &ctx->dmg_st_slot_bytes);   /* the self-test's save-under slots */
+    damage_self_test_free(ctx);
 }
 
 /* The live save-under slots and the size asked for, at every release point. A step never
@@ -234,11 +241,16 @@ static void damage_live_slots_release(customCfwContext *ctx) {
  * from another task meanwhile (deferred above) is honoured now — the scratch and the
  * self-test's slots. Returns 1 if one had. */
 static int damage_self_test_settle(customCfwContext *ctx) {
+    /* the deferred free runs while the mark is still UP, so a release that lands during it is
+     * deferred again rather than freeing the same buffer twice (2026-09-15, the third review) */
+    int had = 0;
+    while (ctx->dmg_st_free_pending) {
+        ctx->dmg_st_free_pending = 0;
+        damage_self_test_free(ctx);             /* still under the mark: a release meanwhile defers again */
+        had = 1;
+    }
     ctx->dmg_st_active = 0;
-    if (!ctx->dmg_st_free_pending) return 0;
-    ctx->dmg_st_free_pending = 0;
-    damage_self_test_release(ctx);
-    return 1;
+    return had;
 }
 
 /* A lapse noticed by cfw_fb_lease_active, or an FB_RELEASE: settle what the flags
@@ -317,7 +329,7 @@ static void damage_send_package(unsigned char *buf, unsigned capacity, unsigned 
 }
 
 static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, int with_cache_crc) {
-    unsigned char body[160];
+    unsigned char body[176];          /* 25 fields, worst case 161 B if every value were 5 bytes */
     unsigned n = 0;
     int leased = cfw_fb_lease_active();          /* notices a lapse first: flags then read 0 */
     uint32_t tick = FW_MS_TICK;
@@ -345,7 +357,10 @@ static void damage_send_telemetry(customCfwContext *ctx, unsigned request_id, in
                     (ctx->f_dup ? 4u : 0u) | (ctx->f_snap_of ? 8u : 0u) |
                     ((cfw_alloc_diag() & 1u) ? 16u : 0u);
     n += damage_put_varint_field(body + n, 11, diag);
-    uint32_t left = leased ? ctx->direct_lease_deadline - tick : 0u;
+    /* the deadline can pass between the lease check and the tick read, and an unsigned subtract
+     * would then report ~4.29e9 ticks left (2026-09-15, the third review) */
+    int32_t remain = (int32_t)(ctx->direct_lease_deadline - tick);
+    uint32_t left = (leased && remain > 0) ? (uint32_t)remain : 0u;
     n += damage_put_varint_field(body + n, 12, left);
     /* field 13 (boot count): not sent — see the header comment */
     n += damage_put_varint_field(body + n, 14, FW_SIDE_ID());

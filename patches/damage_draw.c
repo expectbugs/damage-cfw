@@ -265,9 +265,12 @@ static int damage_read_lens_rect(const uint8_t *p, int lenses_differ, uint32_t p
 /* ---- save-under slots -------------------------------------------------------------------- */
 
 static void damage_slot_free(damage_slot *s, uint32_t *bytes) {
-    uint8_t *buf = s->buf;
+    /* Claim the pointer, then free it: the release points run on three tasks (the settings task,
+     * the input thread, the image worker through mode 11), and a plain load-check-store let two
+     * of them take the same buffer and free it twice (2026-09-15, the third review). The exchange
+     * is one LDREX/STREX pair on this part; whoever wins does the free, the loser sees 0. */
+    uint8_t *buf = __atomic_exchange_n(&s->buf, (uint8_t *)0, __ATOMIC_SEQ_CST);
     if (buf == 0) return;
-    s->buf = 0;
     if (*bytes >= s->bytes) *bytes -= s->bytes; else *bytes = 0;
     s->bytes = 0;
     cfw_heap13_free(buf);
@@ -288,10 +291,15 @@ void damage_slots_free(damage_slot *slots, uint32_t *bytes) {
 static void damage_slots_enter(customCfwContext *ctx) { ctx->dmg_slots_active = 1; }
 
 static void damage_slots_leave(customCfwContext *ctx) {
+    /* The deferred free runs while the mark is still UP, so a release point that lands during it
+     * is deferred again instead of freeing the same buffers a second time (2026-09-15, the third
+     * review: clearing the mark first left the free itself outside the mechanism that protects
+     * it, and both tasks could hand the same heap-13 block back). */
+    while (ctx->dmg_slots_free_pending) {
+        ctx->dmg_slots_free_pending = 0;
+        damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
+    }
     ctx->dmg_slots_active = 0;
-    if (!ctx->dmg_slots_free_pending) return;
-    ctx->dmg_slots_free_pending = 0;
-    damage_slots_free(ctx->dmg_slots, &ctx->dmg_slot_bytes);
 }
 
 
@@ -374,9 +382,13 @@ static int damage_op_string(customCfwContext *ctx, uint8_t *shadow, uint32_t str
         uint32_t ch = string[i];
         if (ch <= 31u) { x += (int32_t)ch - 11; continue; }
         cfw_cached_image g;
-        if (!damage_image1_at(ctx, rd16(table + (ch - 32u) * 2u) * 4u, &g)) {
-            /* validated above: only a release point on another task freeing the cache between
-             * the two passes reaches this, and it is recorded like any other refusal */
+        /* the table pointer is re-derived from the published one, not carried from before the
+         * first pass: a release point on another task can free the cache between the two passes,
+         * and the 2-byte entry read must not go through the stale pointer (2026-09-15, the third
+         * review). The refusal is recorded like any other. */
+        if (ctx->texture_cache == 0) { damage_refuse(src, DMG_REF_RECORD); return -1; }
+        const uint8_t *tbl = ctx->texture_cache + font;
+        if (!damage_image1_at(ctx, rd16(tbl + (ch - 32u) * 2u) * 4u, &g)) {
             damage_refuse(src, DMG_REF_RECORD); return -1;
         }
         damage_render_runs(shadow, stride, &c, x, y, g.rle, g.rle_len, g.width, g.height, lut, transparent);
@@ -423,12 +435,16 @@ static int damage_op_cache_write(customCfwContext *ctx, const uint8_t *src, uint
     }
     pos = 1;
     while (pos < srclen) {
+        if (srclen - pos < 4u) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         uint32_t off = rd16(src + pos) * 4u;
         uint32_t len = rd16(src + pos + 2u);
         pos += 4u;
-        /* the bound is re-read here, not carried from the pass above: the message sits in the
+        /* the bounds are re-read here, not carried from the pass above: the message sits in the
          * receiver's buffer, which a later message can reach (the snapshot tail), so the bytes
-         * this loop indexes with are the bytes it writes with */
+         * this loop indexes with are the bytes it writes with. The SOURCE bound goes with the
+         * cache bound (2026-09-15, the third review): without it a len that grew under the loop
+         * kept the write inside the cache but read past the end of the message. */
+        if (len > srclen - pos) { damage_refuse(src, DMG_REF_LENGTH); return -1; }
         if (off > size || len > size - off) { damage_refuse(src, DMG_REF_RECORD); return -1; }
         for (uint32_t i = 0; i < len; i++) ctx->texture_cache[off + i] = src[pos + i];
         pos += len;
